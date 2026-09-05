@@ -543,24 +543,9 @@ def test_generate_for_message_drafts_prompt_and_persists_asset_and_job(
     assert chat_request.model_id == "fake-chat"
     system_text = _chat_request_system_message(chat_request)
     for expected_guidance in (
-        "visible subject",
-        "setting",
-        "action",
-        "facial expression",
-        "objects",
-        "lighting",
-        "weather",
-        "time of day",
-        "mood",
-        "composition",
-        "continuity",
-        "selected scene message",
-        "highest-priority current moment",
-        "unsupported",
-        "internal",
-        "future details",
-        "Do not specify character clothing",
-        "Current Clothing",
+        "one coherent frame", "distinct physical description", "spatial relationships",
+        "facial expression", "held objects", "lighting", "weather", "framing",
+        "pending reactions", "do not invent consequential", "authoritative clothing",
     ):
         assert expected_guidance in system_text
     chat_context = _chat_request_context(chat_request)
@@ -603,6 +588,100 @@ def test_generate_for_message_drafts_prompt_and_persists_asset_and_job(
     assert jobs[0]["result"]["media_asset_id"] == media_asset.id
     assert jobs[0]["result"]["path"] == media_asset.path
     assert jobs[0]["result"]["prompt_chars"] == len(request.prompt)
+
+
+def test_reference_image_drafts_full_identity_without_template_clipping(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, message, character_id = _full_roleplay_save(repositories)
+    character = repositories.get_character(character_id)
+    assert character is not None
+    appearance = "Silver hair and green eyes. " * 100 + "A crescent scar on the chin."
+    repositories.update_character(replace(character, appearance=appearance))
+    provider = RecordingImageProvider(_VALID_PNG_BYTES)
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": provider},
+        media_dir=tmp_path / "media",
+    )
+
+    asset = asyncio.run(service.generate_character_reference(
+        save_id=save.id, source_message_id=message.id,
+    ))
+
+    assert len(provider.chat_requests) == 1
+    assert appearance in _chat_request_context(provider.chat_requests[0])
+    assert asset.prompt.startswith(provider.drafted_prompt)
+    assert asset.prompt == provider.image_requests[0].prompt
+    assert "Wearing: Silver hair" not in asset.prompt
+
+
+def test_prepared_image_preserves_character_clothing_and_style(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, messages = _save_with_image_preference(repositories)
+    character = repositories.add_character(
+        save_id=save.id, name="Mara", appearance="Braided brown hair.",
+        current_clothing="a green raincoat", source_message_id=messages[-1].id,
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id, present_character_ids=[character.id],
+        source_message_id=messages[-1].id,
+    )
+    provider = RecordingImageProvider(_VALID_PNG_BYTES)
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider},
+        media_dir=tmp_path / "media", automatic_enabled=True, auto_frequency=2,
+    )
+    prepared = service.prepare_automatic_if_due(
+        save_id=save.id, source_message_id=messages[-1].id,
+    )
+    assert prepared is not None
+    prepared = type(prepared).from_json(prepared.to_json())
+    repositories.update_character(replace(
+        character, appearance="LATER silver hair.", current_clothing="LATER red armor",
+    ))
+    repositories.set_app_setting(
+        save_image_style_preset_setting_key(save.id), "anime",
+    )
+
+    asset = asyncio.run(service.generate_prepared_automatic(prepared))
+
+    assert asset is not None
+    assert "a green raincoat" in asset.prompt
+    assert "LATER" not in asset.prompt
+    assert "Style preset: Realistic" in asset.prompt
+    assert "LATER" not in _chat_request_context(provider.chat_requests[0])
+
+
+def test_manually_edited_oversized_prompt_is_rejected_without_redrafting(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, messages = _save_with_image_preference(repositories)
+    provider = RecordingImageProvider(_VALID_PNG_BYTES)
+    media_dir = tmp_path / "media"
+    original = _persist_test_image_asset(
+        repositories, media_dir=media_dir, save_id=save.id,
+        source_message_id=messages[-1].id, filename="original.png", prompt="A bridge.",
+    )
+    repositories.set_app_setting(
+        "image_prompt_model_limits", {"fake": {"fake-image": 100}},
+    )
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider}, media_dir=media_dir,
+    )
+
+    with pytest.raises(ValueError, match="(?i)prompt.*(limit|characters)"):
+        asyncio.run(service.regenerate_asset_with_prompt(
+            save_id=save.id, media_asset_id=original.id,
+            prompt="A stone bridge. " * 100,
+        ))
+
+    assert provider.chat_requests == []
+    assert provider.image_requests == []
 
 
 def test_upload_character_text_player_photo_describes_and_persists_upload(
@@ -913,13 +992,9 @@ def test_generate_character_text_character_image_includes_visual_direction(
             save_id=save.id,
             text_message=text_message,
             character=character,
-            visual_prompt=(
-                "Oracle mirror selfie\n\n"
-                "Character visual direction for Oracle of Glass: "
-                "Wearing: repeated stable appearance.\n"
-                "Current action/pose: holding the mirror toward the beads.\n"
-                "Facial expression: small relieved smile."
-            ),
+            visual_prompt="Oracle mirror selfie",
+            current_action="holding the mirror toward the beads",
+            facial_expression="small relieved smile",
             scene_context="Phone thread:\nMara: Did the robe survive?",
         )
     )
@@ -927,11 +1002,12 @@ def test_generate_character_text_character_image_includes_visual_direction(
     assert len(provider.image_requests) == 1
     request = provider.image_requests[0]
     assert request.source_media_asset_id == reference.id
-    assert "Character visual direction for Oracle of Glass" in request.prompt
-    assert "Wearing: rain-darkened blue glass robes." in request.prompt
-    assert "Wearing: repeated stable appearance." not in request.prompt
-    assert "Current action/pose: holding the mirror toward the beads." in request.prompt
-    assert "Facial expression: small relieved smile." in request.prompt
+    assert "Oracle of Glass: rain-darkened blue glass robes" in request.prompt
+    assert request.prompt.startswith(provider.drafted_prompt)
+    draft_context = _chat_request_context(provider.chat_requests[0])
+    assert "holding the mirror toward the beads" in draft_context
+    assert "small relieved smile" in draft_context
+    assert "Current action/pose:" not in request.prompt
     metadata = json.loads(asset.metadata_json)
     assert metadata["kind"] == "character_text_character_image"
     assert metadata["content_rating"] == "r"
@@ -1024,7 +1100,7 @@ def test_generate_character_text_character_image_completes_current_clothing(
     updated = repositories.get_character(character.id)
     assert updated is not None
     assert updated.current_clothing == "blue glass rain cape"
-    assert "Wearing: blue glass rain cape." in provider.image_requests[0].prompt
+    assert "Oracle of Glass: blue glass rain cape" in provider.image_requests[0].prompt
 
 
 def test_generate_character_text_object_image_persists_openrouter_request_alias(
@@ -1073,6 +1149,9 @@ def test_generate_character_text_object_image_persists_openrouter_request_alias(
                 image_bytes=_VALID_PNG_BYTES,
             )
         ],
+    )
+    repositories.set_model_preference(
+        task="image_prompt", provider="openrouter", model_id="openrouter/chat",
     )
     service = MediaService(
         repositories=repositories,
@@ -1176,13 +1255,7 @@ def test_generate_scene_image_includes_character_visual_direction_without_refere
         message_id=source_message.id,
         character_id=character.id,
     )
-    provider = RecordingImageProvider(
-        _VALID_PNG_BYTES,
-        drafted_prompt=(
-            "cinematic drafted image prompt\n"
-            "Wearing: soot-dark cloak with brass chimes."
-        ),
-    )
+    provider = RecordingImageProvider(_VALID_PNG_BYTES)
     service = MediaService(
         repositories=repositories,
         providers={"fake": provider},
@@ -1200,14 +1273,12 @@ def test_generate_scene_image_includes_character_visual_direction_without_refere
     request = provider.image_requests[0]
     assert request.source_media_asset_id is None
     assert "cinematic drafted image prompt" in request.prompt
-    assert "Character visual direction for Bell Warden" in request.prompt
-    assert "Wearing: borrowed green raincoat over a linen shirt." in request.prompt
-    assert "Wearing: soot-dark cloak with brass chimes." not in request.prompt
-    assert "what each visible character is wearing" not in chat_system_body(
-        provider.chat_requests[0]
-    )
-    assert "Current action/pose: The echo answers from below." in request.prompt
-    assert "Facial expression: expression grounded in this moment" in request.prompt
+    assert "Bell Warden: borrowed green raincoat over a linen shirt" in request.prompt
+    assert "Current action/pose:" not in request.prompt
+    assert "infer from the selected action" not in request.prompt
+    draft_context = _chat_request_context(provider.chat_requests[0])
+    assert "borrowed green raincoat over a linen shirt" in draft_context
+    assert "The echo answers from below" in draft_context
 
 
 def test_generate_scene_image_completes_and_persists_missing_current_clothing(
@@ -1278,7 +1349,7 @@ def test_generate_scene_image_completes_and_persists_missing_current_clothing(
     )
     assert len(provider.clothing_requests) == 1
     prompt = provider.image_requests[0].prompt
-    assert "Wearing: borrowed green raincoat over a linen shirt." in prompt
+    assert "Bell Warden: borrowed green raincoat over a linen shirt" in prompt
     assert "Wearing: Tall, silver-eyed, with white hair." not in prompt
     assert "Wearing: A brass chime hangs from one wrist." not in prompt
 
@@ -1353,7 +1424,7 @@ def test_generate_scene_image_retries_invalid_clothing_then_uses_valid_result(
     assert "Previous structured response was invalid" in (
         provider.clothing_requests[1].messages[-1].body
     )
-    assert "Wearing: charcoal travel coat." in provider.image_requests[0].prompt
+    assert "Bell Warden: charcoal travel coat" in provider.image_requests[0].prompt
 
 
 def test_generate_scene_image_preserves_concurrent_character_lock_and_edit(
@@ -1842,7 +1913,7 @@ def test_generate_for_message_uses_image_prompt_preference_for_prompt_drafting(
     assert chat_request.provider == "prompt"
     assert chat_request.model_id == "prompt/drafter"
     assert chat_request.current_scene_recap
-    assert all(message.role != "user" for message in chat_request.messages)
+    assert any(message.role == "user" for message in chat_request.messages)
     rendered = chat_system_body(chat_request)
     assert rendered.index("BEGIN BRAGI CONTEXT DATA") < rendered.index(
         chat_request.current_scene_recap[0]
@@ -6376,12 +6447,18 @@ def test_generate_character_reference_persists_character_link(
     request = provider.image_requests[0]
     assert request.model_id == "fake-image"
     assert request.source_media_asset_id is None
-    assert "Character reference portrait for Oracle of Glass" in request.prompt
-    assert "mirrored silver eyes" in request.prompt
+    assert "Confirmed subject: Oracle of Glass" in _chat_request_context(
+        provider.chat_requests[0]
+    )
+    assert "mirrored silver eyes" in _chat_request_context(provider.chat_requests[0])
     media_assets = repositories.list_media_assets(save.id)
     assert [item.id for item in media_assets] == [asset.id]
     assert _asset_path(media_dir, asset.path).read_bytes() == _VALID_PNG_BYTES
     assert json.loads(asset.metadata_json) == {
+        "image_prompt": {
+            "version": 1, "submitted_chars": len(asset.prompt),
+            "max_chars": None, "fallback_compressed": False,
+        },
         "content_rating": "g",
         "kind": "character_reference",
         "character_id": character_id,
@@ -6444,7 +6521,7 @@ def test_generate_scoped_reference_does_not_promote_first_image(
     ] == [("character", character_id, asset.id)]
 
 
-def test_generate_character_reference_keeps_prompt_compact_and_visual(
+def test_generate_character_reference_preserves_complete_visual_identity(
     repositories: PersistenceRepositories,
     tmp_path: Path,
 ) -> None:
@@ -6484,22 +6561,19 @@ def test_generate_character_reference_keeps_prompt_compact_and_visual(
         )
     )
 
-    assert len(provider.image_requests) == 1
+    assert len(provider.chat_requests) == 1
+    context = _chat_request_context(provider.chat_requests[0])
+    assert long_visual_description in context
+    for excluded in (
+        "nonvisual relationship backstory marker",
+        "nonvisual current emotional state marker",
+        "nonvisual personality marker", "temporary raincoat",
+    ):
+        assert excluded not in context
     prompt = provider.image_requests[0].prompt
-    assert "Unique visible identity marker" in prompt
-    assert 1 <= prompt.count("Unique visible identity marker") <= 2
-    assert "nonvisual relationship backstory marker" not in prompt
-    assert "nonvisual current emotional state marker" not in prompt
-    assert "nonvisual personality marker" not in prompt
-    assert "temporary raincoat" not in prompt
-    assert "Character visual direction for Oracle of Glass" in prompt
-    assert "Wearing: Unique visible identity marker" in prompt
-    assert "Current action/pose: stable reusable reference portrait pose" in prompt
-    assert (
-        "Facial expression: neutral, reusable character-reference expression"
-        in prompt
-    )
-    assert len(prompt) <= 1800
+    assert prompt.startswith(provider.drafted_prompt)
+    assert "Wearing:" not in prompt
+    assert "infer" not in prompt
 
 
 def test_generate_character_reference_rejects_unavailable_image_model(
@@ -6572,8 +6646,8 @@ def test_generate_character_reference_allows_full_roleplay_character(
 
     assert provider.image_requests[0].source_media_asset_id is None
     assert (
-        "Character reference portrait for Bell Warden"
-        in provider.image_requests[0].prompt
+        "Confirmed subject: Bell Warden"
+        in _chat_request_context(provider.chat_requests[0])
     )
     assert "Borrowed green raincoat" not in provider.image_requests[0].prompt
     links = repositories.list_entity_links(save.id)
@@ -6663,16 +6737,18 @@ def test_scene_generation_uses_present_character_reference(
     assert scene_request.source_media_path == media_dir / reference.path
     assert scene_request.source_media_asset_ids == (reference.id,)
     assert scene_request.source_media_paths == (media_dir / reference.path,)
-    assert "Use the attached character reference image" in scene_request.prompt
-    assert "Character visual direction for Oracle of Glass" in scene_request.prompt
-    assert "Wearing:" not in scene_request.prompt
-    assert "Current action/pose: The oracle turns toward the moonlit window." in (
-        scene_request.prompt
+    assert "Attached image 1 anchors Oracle of Glass" in scene_request.prompt
+    assert scene_request.prompt.startswith(provider.drafted_prompt)
+    assert "The oracle turns toward the moonlit window" in _chat_request_context(
+        provider.chat_requests[-1]
     )
-    expected_expression = "Facial expression: expression grounded in this moment"
-    assert expected_expression in scene_request.prompt
+    assert "Current action/pose:" not in scene_request.prompt
     assert scene_asset.source_media_asset_id == reference.id
     assert json.loads(scene_asset.metadata_json) == {
+        "image_prompt": {
+            "version": 1, "submitted_chars": len(scene_asset.prompt),
+            "max_chars": None, "fallback_compressed": False,
+        },
         "content_rating": "g",
         "kind": "scene_image",
         "source_character_reference_asset_id": reference.id,
@@ -6682,7 +6758,7 @@ def test_scene_generation_uses_present_character_reference(
     }
 
 
-def test_scene_generation_uses_present_and_mentioned_character_references_up_to_cap(
+def test_scene_generation_excludes_merely_mentioned_character_references(
     repositories: PersistenceRepositories,
     tmp_path: Path,
 ) -> None:
@@ -6791,24 +6867,26 @@ def test_scene_generation_uses_present_and_mentioned_character_references_up_to_
     assert request.model_id == "fake-edit"
     assert request.source_media_asset_ids == (
         present_reference.id,
-        mentioned_reference.id,
     )
     assert request.source_media_paths == (
         media_dir / present_reference.path,
-        media_dir / mentioned_reference.path,
     )
     assert omitted_reference.id not in request.source_media_asset_ids
+    assert mentioned_reference.id not in request.source_media_asset_ids
     assert asset.source_media_asset_id == present_reference.id
     assert json.loads(asset.metadata_json) == {
+        "image_prompt": {
+            "version": 1, "submitted_chars": len(asset.prompt),
+            "max_chars": None, "fallback_compressed": False,
+        },
         "content_rating": "g",
         "kind": "scene_image",
         "source_character_reference_asset_id": present_reference.id,
         "source_character_reference_asset_ids": [
             present_reference.id,
-            mentioned_reference.id,
-        ],
-        "source_character_reference_character_ids": [present.id, mentioned.id],
-        "source_character_reference_character_names": ["Mara Voss", "Bell Warden"],
+            ],
+        "source_character_reference_character_ids": [present.id],
+        "source_character_reference_character_names": ["Mara Voss"],
     }
 
 
@@ -6930,21 +7008,18 @@ def test_character_image_generation_uses_reference_image_to_image(
     assert character_request.model_id == "fake-character-edit"
     assert character_request.source_media_asset_id == reference.id
     assert character_request.source_media_path == media_dir / reference.path
-    assert "Use the attached character reference image" in character_request.prompt
-    assert "Show only this one character" in character_request.prompt
-    assert "Do not include other people" in character_request.prompt
-    assert "The oracle turns toward the moonlit window" in character_request.prompt
-    assert "Character visual direction for Oracle of Glass" in character_request.prompt
-    assert "Wearing:" not in character_request.prompt
-    assert "Current action/pose: The oracle turns toward the moonlit window." in (
-        character_request.prompt
-    )
-    assert (
-        "Facial expression: expression grounded in this moment"
-        in character_request.prompt
-    )
+    assert "Attached image 1 anchors Oracle of Glass" in character_request.prompt
+    assert character_request.prompt.startswith(provider.drafted_prompt)
+    draft_context = _chat_request_context(provider.chat_requests[0])
+    assert "exactly one subject" in draft_context
+    assert "The oracle turns toward the moonlit window" in draft_context
+    assert "Current action/pose:" not in character_request.prompt
     assert asset.source_media_asset_id == character_request.source_media_asset_id
     assert json.loads(asset.metadata_json) == {
+        "image_prompt": {
+            "version": 1, "submitted_chars": len(asset.prompt),
+            "max_chars": None, "fallback_compressed": False,
+        },
         "content_rating": "g",
         "kind": "character_image",
         "character_id": character_id,
@@ -7014,6 +7089,9 @@ def test_character_image_generation_uses_image_edit_fallback(
                 image_bytes=_VALID_PNG_BYTES,
             )
         ],
+    )
+    repositories.set_model_preference(
+        task="image_prompt", provider="primary", model_id="primary/chat",
     )
     service = MediaService(
         repositories=repositories,
@@ -7110,6 +7188,9 @@ def test_character_image_generation_uses_legacy_image_fallback_for_edit(
             )
         ],
     )
+    repositories.set_model_preference(
+        task="image_prompt", provider="primary", model_id="primary/chat",
+    )
     service = MediaService(
         repositories=repositories,
         providers={"primary": primary_provider, "fallback": fallback_provider},
@@ -7197,15 +7278,14 @@ def test_character_image_generation_allows_full_roleplay_save(
     assert request.model_id == "fake-edit"
     assert request.source_media_asset_id == reference.id
     assert request.source_media_path == media_dir / reference.path
-    assert "Show only this one character" in request.prompt
-    assert "Do not include other people" in request.prompt
-    assert scene_message.body in request.prompt
-    assert "Character visual direction for Mara" in request.prompt
-    assert "Wearing:" not in request.prompt
-    assert "Current action/pose: The echo answers from below." in request.prompt
-    assert "Facial expression: expression grounded in this moment" in request.prompt
-    assert asset.source_media_asset_id == reference.id
+    assert "exactly one subject" in _chat_request_context(provider.chat_requests[0])
+    assert request.prompt.startswith(provider.drafted_prompt)
+    assert "Current action/pose:" not in request.prompt
     assert json.loads(asset.metadata_json) == {
+        "image_prompt": {
+            "version": 1, "submitted_chars": len(asset.prompt),
+            "max_chars": None, "fallback_compressed": False,
+        },
         "content_rating": "g",
         "kind": "character_image",
         "character_id": character.id,
@@ -7309,16 +7389,16 @@ def test_character_registry_image_generation_uses_reference_without_message_link
     assert len(provider.image_requests) == 1
     request = provider.image_requests[0]
     assert request.source_media_asset_id == reference.id
-    assert "blue dawn rim light" in request.prompt
-    assert "Show only this one character" in request.prompt
-    assert "Character visual direction for Oracle of Glass" in request.prompt
-    assert "Wearing:" not in request.prompt
-    assert "Current action/pose: blue dawn rim light." in request.prompt
-    expected_expression = "Facial expression: expression grounded in this moment"
-    assert expected_expression in request.prompt
-    assert asset.source_message_id is None
-    assert asset.source_media_asset_id == reference.id
+    context = _chat_request_context(provider.chat_requests[0])
+    assert "blue dawn rim light" in context
+    assert "exactly one subject" in context
+    assert request.prompt.startswith(provider.drafted_prompt)
+    assert "Current action/pose:" not in request.prompt
     assert json.loads(asset.metadata_json) == {
+        "image_prompt": {
+            "version": 1, "submitted_chars": len(asset.prompt),
+            "max_chars": None, "fallback_compressed": False,
+        },
         "content_rating": "g",
         "kind": "character_image",
         "character_id": character_id,
@@ -9439,6 +9519,10 @@ def test_automatic_scene_generation_uses_present_character_reference(
     assert request.source_media_path == media_dir / reference.path
     assert asset.source_media_asset_id == reference.id
     assert json.loads(asset.metadata_json) == {
+        "image_prompt": {
+            "version": 1, "submitted_chars": len(asset.prompt),
+            "max_chars": None, "fallback_compressed": False,
+        },
         "content_rating": "g",
         "kind": "scene_image",
         "source_character_reference_asset_id": reference.id,
@@ -9805,7 +9889,9 @@ def _configure_video_fallback(
 
 
 def _chat_request_context(request: ChatRequest) -> str:
-    return chat_system_body(request)
+    return "\n\n".join((
+        chat_system_body(request), *(message.body for message in request.messages),
+    ))
 
 
 def _chat_request_system_message(request: ChatRequest) -> str:

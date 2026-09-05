@@ -33,8 +33,6 @@ from bragi.persistence.repositories import PersistenceRepositories
 from bragi.private_files import ensure_private_dir, write_private_bytes
 from bragi.providers.contracts import (
     ChatMessage,
-    ChatPromptPurpose,
-    ChatRequest,
     ImageDescriptionRequest,
     ImageReferenceLimitProvider,
     ImageRequest,
@@ -72,17 +70,22 @@ from bragi.services.content_safety_service import (
 from bragi.services.context_assembly import (
     ContextAssemblyBreakdown,
     ContextAssemblyService,
+    image_scene_characters,
 )
 from bragi.services.generation_settings import image_generation_dimensions
+from bragi.services.image_prompt_limits import image_prompt_max_chars
+from bragi.services.image_prompt_service import (
+    ImagePromptBrief,
+    ImagePromptReference,
+    ImagePromptService,
+    ImagePromptSubject,
+)
 from bragi.services.image_style_settings import (
-    apply_image_style_preset,
     selected_image_style_preset,
 )
 from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.media_content_rating import media_asset_content_rating
-from bragi.services.mention_matching import character_name_is_mentioned
 from bragi.services.model_capabilities import (
-    CHAT_CAPABILITIES,
     IMAGE_GENERATION_CAPABILITIES,
     IMAGE_TO_IMAGE_CAPABILITIES,
     IMAGE_TO_VIDEO_CAPABILITIES,
@@ -104,8 +107,6 @@ from bragi.services.model_preferences import (
     image_edit_model_preference,
     model_preference_for_selector,
     roleplay_model_preference,
-    roleplay_model_task,
-    shared_roleplay_models_enabled,
 )
 from bragi.services.openrouter_routing_settings import (
     OPENROUTER_PROVIDER_NAME,
@@ -114,7 +115,6 @@ from bragi.services.openrouter_routing_settings import (
     request_with_openrouter_routing,
 )
 from bragi.services.provider_fallbacks import (
-    chat_with_fallback,
     structured_output_with_fallback,
 )
 from bragi.services.sexual_content_safety import (
@@ -136,13 +136,6 @@ _ENFORCED_MEDIA_SAFE_MODE_REQUIRED_ERROR = (
     "This account can generate media only through a provider with enforced safe mode"
 )
 _VENICE_ANIMATION_PROMPT_MAX_CHARS = 2400
-_CHARACTER_REFERENCE_PROMPT_MAX_CHARS = 1600
-_CHARACTER_REFERENCE_SINGLE_FIELD_MAX_CHARS = 1250
-_CHARACTER_REFERENCE_MULTI_FIELD_MAX_CHARS = 650
-_CHARACTER_REFERENCE_FALLBACK_FIELD_MAX_CHARS = 480
-_CHARACTER_IMAGE_PROMPT_MAX_CHARS = 2400
-_CHARACTER_VISUAL_DIRECTION_MAX_CHARS = 700
-_CHARACTER_VISUAL_DIRECTION_FIELD_MAX_CHARS = 220
 _MAX_DIAGNOSTIC_ERROR_MESSAGE_CHARS = 1000
 _CHARACTER_REFERENCE_RELATION = "reference_image"
 _CHARACTER_REFERENCE_CANDIDATE_KINDS = frozenset(
@@ -251,6 +244,7 @@ class PreparedAutomaticImage:
     metadata: dict[str, object] | None = None
     request_task: str | None = None
     character_visual_directions: str = ""
+    image_prompt_brief: ImagePromptBrief | None = None
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -273,12 +267,16 @@ class PreparedAutomaticImage:
             "metadata": self.metadata,
             "request_task": self.request_task,
             "character_visual_directions": self.character_visual_directions,
+            "image_prompt_brief": (
+                self.image_prompt_brief.to_json() if self.image_prompt_brief else None
+            ),
         }
 
     @classmethod
     def from_json(cls, payload: Mapping[str, object]) -> PreparedAutomaticImage:
         source_media_path = payload.get("source_media_path")
         source_media_paths = payload.get("source_media_paths") or ()
+        brief_payload = payload.get("image_prompt_brief")
         return cls(
             save_id=str(payload["save_id"]),
             source_message_id=str(payload["source_message_id"]),
@@ -290,6 +288,10 @@ class PreparedAutomaticImage:
             provider=str(payload["provider"]),
             model_id=str(payload["model_id"]),
             narrator_message_count=int(cast(int, payload["narrator_message_count"])),
+            image_prompt_brief=(
+                ImagePromptBrief.from_json(cast(Mapping[str, object], brief_payload))
+                if isinstance(brief_payload, Mapping) else None
+            ),
             media_type=str(payload.get("media_type") or "image"),
             source_media_asset_id=(
                 str(payload["source_media_asset_id"])
@@ -925,7 +927,7 @@ class MediaService:
                     type="image",
                     path=path,
                     thumbnail_path=thumbnail_path,
-                    prompt=prompt,
+                    prompt=generation.request.prompt,
                     provider=response.provider,
                     model=_persisted_image_model(generation),
                     status="succeeded",
@@ -966,7 +968,7 @@ class MediaService:
                         "media_asset_id": asset.id,
                         "replaced_media_asset_id": original.id,
                         "path": asset.path,
-                        "prompt_chars": len(prompt),
+                        "prompt_chars": len(generation.request.prompt),
                         "provider": asset.provider,
                         "model": asset.model,
                         "source_media_asset_id": primary_source_media_asset_id,
@@ -1080,10 +1082,12 @@ class MediaService:
             self.repositories,
             save_id=save_id,
         )
-        prompt = apply_image_style_preset(
-            _character_reference_prompt(character),
-            preset_id=image_style_preset,
+        brief = ImagePromptBrief(
+            purpose="character_reference",
+            subjects=(_image_prompt_subject(character, reusable_reference=True),),
+            style_preset=image_style_preset,
         )
+        prompt = ""
         job = self.jobs.create_running(
             save_id=save_id,
             type="character_reference_image",
@@ -1129,6 +1133,12 @@ class MediaService:
             )
             if requirement_error is not None:
                 raise ValueError(requirement_error)
+            prompt = await self._draft_brief(
+                save_id=save_id,
+                source_message_id=resolved_source_message_id,
+                brief=brief,
+                preference=preference,
+            )
             generation = await self._generate_image_with_optional_fallback(
                 save_id=save_id,
                 request=await self._image_request(
@@ -1137,6 +1147,7 @@ class MediaService:
                     prompt=prompt,
                     save_id=save_id,
                     source_message_id=resolved_source_message_id,
+                    prompt_brief=brief,
                     retry_progress_callback=retry_progress_callback,
                     current_user_id=current_user_id,
                 ),
@@ -1156,7 +1167,7 @@ class MediaService:
                 type="image",
                 path=path,
                 thumbnail_path=thumbnail_path,
-                prompt=prompt,
+                prompt=generation.request.prompt,
                 provider=response.provider,
                 model=_persisted_image_model(generation),
                 status="succeeded",
@@ -1765,17 +1776,18 @@ class MediaService:
                 image_context=scene_context,
             )
         )[0]
-        prompt = _solo_character_scene_image_prompt(
+        brief = self._character_prompt_brief(
             character=character,
-            character_name=character.name,
-            action_context=source_message.body,
+            request_context=request_context,
+            purpose="solo_character",
+            source_moment=source_message.body,
             scene_context=scene_context,
         )
         return await self._generate_character_image_asset(
             save_id=save_id,
             source_message_id=source_message_id,
             request_source_message_id=source_message_id,
-            prompt=prompt,
+            prompt_brief=brief,
             scene_context=scene_context,
             context_breakdown_json=context_breakdown.to_json(),
             preference=request_context.preference,
@@ -1826,10 +1838,11 @@ class MediaService:
                 image_context=instructions,
             )
         )[0]
-        prompt = _solo_character_registry_image_prompt(
+        brief = self._character_prompt_brief(
             character=character,
-            character_name=character.name,
-            instructions=instructions,
+            request_context=request_context,
+            purpose="solo_character",
+            intent=instructions,
         )
         request_source_message_id = (
             character.source_message_id
@@ -1840,7 +1853,7 @@ class MediaService:
             save_id=save_id,
             source_message_id=None,
             request_source_message_id=request_source_message_id,
-            prompt=prompt,
+            prompt_brief=brief,
             scene_context="",
             context_breakdown_json={},
             preference=request_context.preference,
@@ -1864,6 +1877,8 @@ class MediaService:
         character: CharacterRecord,
         visual_prompt: str,
         scene_context: str,
+        current_action: str = "",
+        facial_expression: str = "",
         retry_progress_callback: ProviderRetryProgressCallback | None = None,
         current_user_id: str | None = None,
     ) -> MediaAssetRecord:
@@ -1900,16 +1915,15 @@ class MediaService:
                 ),
             )
         )[0]
-        visual_prompt = _prompt_with_current_clothing_direction(
-            visual_prompt,
+        brief = self._character_prompt_brief(
             character=character,
-        )
-        prompt = _solo_character_text_image_prompt(
-            character=character,
-            character_name=character.name,
-            text_body=text_message.body,
-            visual_prompt=visual_prompt,
+            request_context=request_context,
+            purpose="character_selfie",
+            source_moment=text_message.body,
+            intent=visual_prompt,
             scene_context=scene_context,
+            current_action=current_action,
+            facial_expression=facial_expression,
         )
         metadata = {
             **(request_context.metadata or {}),
@@ -1925,7 +1939,7 @@ class MediaService:
             save_id=save_id,
             source_message_id=None,
             request_source_message_id=text_message.id,
-            prompt=prompt,
+            prompt_brief=brief,
             scene_context=scene_context,
             context_breakdown_json={},
             preference=request_context.preference,
@@ -1967,17 +1981,20 @@ class MediaService:
             raise ValueError(
                 f"Image generation provider is unavailable: {preference.provider}"
             )
-        prompt = _object_context_text_image_prompt(
-            character_name=character.name,
-            text_body=text_message.body,
-            visual_prompt=visual_prompt,
+        brief = ImagePromptBrief(
+            purpose="object_attachment",
+            source_moment=text_message.body,
+            intent=visual_prompt,
             scene_context=scene_context,
+            style_preset=selected_image_style_preset(
+                self.repositories, save_id=save_id,
+            ),
         )
         return await self._generate_prompted_image_asset(
             save_id=save_id,
             source_message_id=None,
             request_source_message_id=text_message.id,
-            prompt=prompt,
+            prompt_brief=brief,
             scene_context=scene_context,
             context_breakdown_json={},
             preference=preference,
@@ -2277,6 +2294,7 @@ class MediaService:
         request_task: str | None = None,
         character_visual_directions: str = "",
         current_user_id: str | None = None,
+        prompt_brief: ImagePromptBrief | None = None,
     ) -> MediaAssetRecord:
         source_message = _source_message(
             messages=self.repositories.list_messages(save_id),
@@ -2284,22 +2302,24 @@ class MediaService:
         )
         if source_message is not None:
             _raise_if_safety_transition_source(source_message)
-        scene_characters = _scene_characters(
-            repositories=self.repositories,
-            save_id=save_id,
-            source_message_id=source_message_id,
-        )
-        await self._ensure_current_clothing(
-            save_id=save_id,
-            characters=scene_characters,
-            image_context=scene_context,
-        )
-        character_visual_directions = _scene_character_visual_directions(
-            repositories=self.repositories,
-            save_id=save_id,
-            source_message_id=source_message_id,
-            action_context=source_message.body if source_message is not None else "",
-        )
+        if prompt_brief is None:
+            characters = await self._ensure_current_clothing(
+                save_id=save_id,
+                characters=image_scene_characters(
+                    self.repositories, save_id=save_id,
+                    source_message_id=source_message_id,
+                ),
+                image_context=scene_context,
+            )
+            prompt_brief = self._scene_prompt_brief(
+                save_id=save_id, source_message_id=source_message_id,
+                scene_context=scene_context, characters=characters,
+                metadata=metadata,
+            )
+        else:
+            prompt_brief = await self._complete_prepared_brief_clothing(
+                save_id=save_id, brief=prompt_brief,
+            )
         source_media_asset_ids = _normalized_source_media_asset_ids(
             source_media_asset_id,
             source_media_asset_ids,
@@ -2314,10 +2334,7 @@ class MediaService:
         primary_source_media_path = (
             source_media_paths[0] if source_media_paths else None
         )
-        image_style_preset = selected_image_style_preset(
-            self.repositories,
-            save_id=save_id,
-        )
+        image_style_preset = prompt_brief.style_preset
         job = self.jobs.create_running(
             save_id=save_id,
             type=job_type,
@@ -2376,30 +2393,17 @@ class MediaService:
             )
             if requirement_error is not None:
                 raise ValueError(requirement_error)
-            prompt = await self._draft_image_prompt(
-                save_id=save_id,
-                source_message_id=source_message_id,
-                scene_context=scene_context,
+            prompt = await self._draft_brief(
+                save_id=save_id, source_message_id=source_message_id,
+                brief=prompt_brief, preference=preference,
             )
-            prompt = _prompt_with_character_visual_directions(
-                prompt,
-                character_visual_directions,
-            )
-            prompt = apply_image_style_preset(
-                prompt,
-                preset_id=image_style_preset,
-            )
-            if source_media_asset_ids:
-                prompt = _image_to_image_prompt(
-                    prompt,
-                    reference_count=len(source_media_asset_ids),
-                )
             generation = await self._generate_image_with_optional_fallback(
                 save_id=save_id,
                 request=await self._image_request(
                     provider=preference.provider,
                     model_id=preference.model_id,
                     prompt=prompt,
+                    prompt_brief=prompt_brief,
                     save_id=save_id,
                     source_message_id=source_message_id,
                     retry_progress_callback=retry_progress_callback,
@@ -2426,7 +2430,7 @@ class MediaService:
                 type="image",
                 path=path,
                 thumbnail_path=thumbnail_path,
-                prompt=prompt,
+                prompt=generation.request.prompt,
                 provider=response.provider,
                 model=_persisted_image_model(generation),
                 status="succeeded",
@@ -2439,7 +2443,7 @@ class MediaService:
                 result={
                     "media_asset_id": asset.id,
                     "path": asset.path,
-                    "prompt_chars": len(prompt),
+                    "prompt_chars": len(generation.request.prompt),
                     "image_style_preset": image_style_preset,
                     "context_breakdown": context_breakdown_json,
                     "provider": asset.provider,
@@ -2501,6 +2505,7 @@ class MediaService:
         save_id: str,
         characters: tuple[CharacterRecord, ...],
         image_context: str,
+        preserve_captured_state: bool = False,
     ) -> tuple[CharacterRecord, ...]:
         missing = tuple(
             character
@@ -2609,7 +2614,10 @@ class MediaService:
                     )
                     current = self.repositories.get_character(character.id)
                 if current is not None:
-                    updated_by_id[character.id] = current
+                    updated_by_id[character.id] = (
+                        replace(character, current_clothing=completed[character.id])
+                        if preserve_captured_state else current
+                    )
             log_event(
                 "media.current_clothing_completed",
                 save_id=save_id,
@@ -2638,7 +2646,7 @@ class MediaService:
         save_id: str,
         source_message_id: str | None,
         request_source_message_id: str,
-        prompt: str,
+        prompt_brief: ImagePromptBrief,
         scene_context: str,
         context_breakdown_json: dict[str, object],
         preference: ModelPreferenceRecord,
@@ -2649,11 +2657,8 @@ class MediaService:
         request_task: str | None = None,
         current_user_id: str | None = None,
     ) -> MediaAssetRecord:
-        image_style_preset = selected_image_style_preset(
-            self.repositories,
-            save_id=save_id,
-        )
-        prompt = apply_image_style_preset(prompt, preset_id=image_style_preset)
+        image_style_preset = prompt_brief.style_preset
+        prompt = ""
         metadata_context = metadata or {}
         context_source_media_asset_id = metadata_context.get("source_media_asset_id")
         context_source_media_asset_ids = (
@@ -2715,12 +2720,17 @@ class MediaService:
             )
             if requirement_error is not None:
                 raise ValueError(requirement_error)
+            prompt = await self._draft_brief(
+                save_id=save_id, source_message_id=request_source_message_id,
+                brief=prompt_brief, preference=preference,
+            )
             generation = await self._generate_image_with_optional_fallback(
                 save_id=save_id,
                 request=await self._image_request(
                     provider=preference.provider,
                     model_id=preference.model_id,
                     prompt=prompt,
+                    prompt_brief=prompt_brief,
                     save_id=save_id,
                     source_message_id=request_source_message_id,
                     retry_progress_callback=retry_progress_callback,
@@ -2743,7 +2753,7 @@ class MediaService:
                 type="image",
                 path=path,
                 thumbnail_path=thumbnail_path,
-                prompt=prompt,
+                prompt=generation.request.prompt,
                 provider=response.provider,
                 model=_persisted_image_model(generation),
                 status="succeeded",
@@ -2755,7 +2765,7 @@ class MediaService:
                 result={
                     "media_asset_id": asset.id,
                     "path": asset.path,
-                    "prompt_chars": len(prompt),
+                    "prompt_chars": len(generation.request.prompt),
                     "image_style_preset": image_style_preset,
                     "context_breakdown": context_breakdown_json,
                     "provider": asset.provider,
@@ -2813,7 +2823,7 @@ class MediaService:
         save_id: str,
         source_message_id: str | None,
         request_source_message_id: str,
-        prompt: str,
+        prompt_brief: ImagePromptBrief,
         scene_context: str,
         context_breakdown_json: dict[str, object],
         preference: ModelPreferenceRecord,
@@ -2842,15 +2852,8 @@ class MediaService:
         primary_source_media_path = (
             source_media_paths[0] if source_media_paths else None
         )
-        image_style_preset = selected_image_style_preset(
-            self.repositories,
-            save_id=save_id,
-        )
-        prompt = apply_image_style_preset(prompt, preset_id=image_style_preset)
-        prompt = _image_to_image_prompt(
-            prompt,
-            reference_count=len(source_media_asset_ids),
-        )
+        image_style_preset = prompt_brief.style_preset
+        prompt = ""
         job = self.jobs.create_running(
             save_id=save_id,
             type=job_type,
@@ -2907,12 +2910,17 @@ class MediaService:
             )
             if requirement_error is not None:
                 raise ValueError(requirement_error)
+            prompt = await self._draft_brief(
+                save_id=save_id, source_message_id=request_source_message_id,
+                brief=prompt_brief, preference=preference,
+            )
             generation = await self._generate_image_with_optional_fallback(
                 save_id=save_id,
                 request=await self._image_request(
                     provider=preference.provider,
                     model_id=preference.model_id,
                     prompt=prompt,
+                    prompt_brief=prompt_brief,
                     save_id=save_id,
                     source_message_id=request_source_message_id,
                     retry_progress_callback=retry_progress_callback,
@@ -2939,7 +2947,7 @@ class MediaService:
                 type="image",
                 path=path,
                 thumbnail_path=thumbnail_path,
-                prompt=prompt,
+                prompt=generation.request.prompt,
                 provider=response.provider,
                 model=_persisted_image_model(generation),
                 status="succeeded",
@@ -2952,7 +2960,7 @@ class MediaService:
                 result={
                     "media_asset_id": asset.id,
                     "path": asset.path,
-                    "prompt_chars": len(prompt),
+                    "prompt_chars": len(generation.request.prompt),
                     "image_style_preset": image_style_preset,
                     "context_breakdown": context_breakdown_json,
                     "provider": asset.provider,
@@ -3251,6 +3259,17 @@ class MediaService:
             save_id=save_id,
             source_message_id=source_message[0].id,
         )
+        image_prompt_brief = (
+            self._scene_prompt_brief(
+                save_id=save_id, source_message_id=source_message[0].id,
+                scene_context=scene_context, metadata=metadata,
+                characters=image_scene_characters(
+                    self.repositories, save_id=save_id,
+                    source_message_id=source_message[0].id,
+                ),
+            )
+            if media_type == "image" else None
+        )
         return PreparedAutomaticImage(
             save_id=save_id,
             source_message_id=source_message[0].id,
@@ -3259,6 +3278,7 @@ class MediaService:
             provider=preference.provider,
             model_id=preference.model_id,
             narrator_message_count=source_message[1],
+            image_prompt_brief=image_prompt_brief,
             media_type=media_type,
             source_media_asset_id=source_media_asset_id,
             source_media_path=source_media_path,
@@ -3336,6 +3356,11 @@ class MediaService:
             metadata=prepared.metadata,
             request_task=prepared.request_task,
             character_visual_directions=prepared.character_visual_directions,
+            prompt_brief=prepared.image_prompt_brief or ImagePromptBrief(
+                scene_context=prepared.scene_context,
+                intent=prepared.character_visual_directions,
+                references=_image_prompt_references(prepared.metadata),
+            ),
             current_user_id=current_user_id,
         )
 
@@ -3426,17 +3451,6 @@ class MediaService:
         source_message_id: str,
         fallback_preference: ModelPreferenceRecord,
     ) -> _ImageRequestContext:
-        source_message = _source_message(
-            messages=self.repositories.list_messages(save_id),
-            source_message_id=source_message_id,
-        )
-        action_context = source_message.body if source_message is not None else ""
-        character_visual_directions = _scene_character_visual_directions(
-            repositories=self.repositories,
-            save_id=save_id,
-            source_message_id=source_message_id,
-            action_context=action_context,
-        )
         references = _selected_scene_character_references(
             repositories=self.repositories,
             media_dir=self.media_dir,
@@ -3448,7 +3462,6 @@ class MediaService:
                 preference=fallback_preference,
                 metadata={"kind": "scene_image"},
                 request_task="image_generation",
-                character_visual_directions=character_visual_directions,
             )
 
         preference = self._image_edit_preference(
@@ -3483,7 +3496,6 @@ class MediaService:
                 ],
             },
             request_task=SCENE_IMAGE_EDIT_PURPOSE,
-            character_visual_directions=character_visual_directions,
         )
 
     def _character_image_request_context(
@@ -3532,7 +3544,17 @@ class MediaService:
         route_openrouter: bool = True,
         current_user_id: str | None = None,
         reviewed_content_rating: str | None = None,
+        prompt_brief: ImagePromptBrief | None = None,
     ) -> ImageRequest:
+        max_chars = image_prompt_max_chars(
+            self.repositories, provider=provider, model_id=model_id,
+            has_references=bool(source_media_asset_id or source_media_asset_ids),
+        )
+        if max_chars is not None and len(prompt) > max_chars:
+            raise ValueError(
+                f"Image prompt has {len(prompt)} characters; "
+                f"{provider}/{model_id} permits {max_chars} characters"
+            )
         content_safety = effective_content_safety_policy(
             self.repositories,
             user_id=current_user_id,
@@ -3600,6 +3622,9 @@ class MediaService:
             ),
             openrouter_provider_routing=openrouter_provider_routing,
             retry_progress_callback=retry_progress_callback,
+            allow_prompt_compression=prompt_brief is not None,
+            prompt_required_text=(prompt_brief.required_text() if prompt_brief else ""),
+            image_prompt_brief=(prompt_brief.to_json() if prompt_brief else None),
         )
         if not route_openrouter:
             return request
@@ -3610,12 +3635,76 @@ class MediaService:
             save_id=save_id,
         )
 
+    async def _fit_image_request(self, request: ImageRequest) -> ImageRequest:
+        original_prompt = request.prompt
+        if request.image_prompt_brief is not None:
+            brief = ImagePromptBrief.from_json(request.image_prompt_brief)
+            retained_ids = set(_normalized_source_media_asset_ids(
+                request.source_media_asset_id, request.source_media_asset_ids,
+            ))
+            retained = tuple(
+                reference for reference in brief.references
+                if reference.media_asset_id in retained_ids
+            )
+            if retained != brief.references:
+                body = request.prompt.removesuffix(
+                    request.prompt_required_text,
+                ).rstrip()
+                brief = replace(brief, references=retained)
+                required_text = brief.required_text()
+                request = replace(
+                    request,
+                    prompt="\n\n".join(part for part in (body, required_text) if part),
+                    prompt_required_text=required_text,
+                    image_prompt_brief=brief.to_json(),
+                )
+        max_chars = image_prompt_max_chars(
+            self.repositories, provider=request.provider, model_id=request.model_id,
+            has_references=_image_request_has_source_media(request),
+        )
+        if max_chars is not None and len(request.prompt) > max_chars:
+            if not request.allow_prompt_compression:
+                raise ValueError(
+                    f"Image prompt has {len(request.prompt)} characters; "
+                    f"{request.provider}/{request.model_id} permits "
+                    f"{max_chars} characters"
+                )
+            prompt = await ImagePromptService(
+                repositories=self.repositories, providers=self.providers,
+            ).fit_prompt(
+                save_id=request.source_save_id,
+                source_message_id=request.source_message_id,
+                prompt=request.prompt, required_text=request.prompt_required_text,
+                max_prompt_chars=max_chars,
+            )
+            request = replace(request, prompt=prompt)
+        if request.prompt != original_prompt:
+            safety = await self.content_safety_service.review_media_prompt(
+                prompt=request.prompt, content_rating=request.content_rating,
+                save_id=request.source_save_id, source_provider=request.provider,
+                source_model_id=request.model_id,
+            )
+            if safety.action is not ContentSafetyAction.ALLOW:
+                raise ValueError("Image prompt exceeds the selected content rating")
+            request = replace(request, content_rating=safety.minimum_rating)
+        return request
+
+    def _image_prompt_diagnostics(self, request: ImageRequest) -> dict[str, object]:
+        return {
+            "submitted_prompt_chars": len(request.prompt),
+            "image_prompt_max_chars": image_prompt_max_chars(
+                self.repositories, provider=request.provider, model_id=request.model_id,
+                has_references=_image_request_has_source_media(request),
+            ),
+        }
+
     async def _generate_image_with_optional_fallback(
         self,
         *,
         save_id: str,
         request: ImageRequest,
     ) -> _ImageGenerationResult:
+        request = await self._fit_image_request(request)
         requirement_error = _image_model_requirement_error(
             repositories=self.repositories,
             provider=request.provider,
@@ -3626,6 +3715,7 @@ class MediaService:
             raise ValueError(requirement_error)
         primary_provider = self.providers[request.provider]
         diagnostics: dict[str, object] = {
+            **self._image_prompt_diagnostics(request),
             "original_provider": request.provider,
             "original_model": request.model_id,
             "fallback_used": False,
@@ -3802,7 +3892,14 @@ class MediaService:
         fallback: _ImageFallbackRequest,
         diagnostics: dict[str, object],
     ) -> _ImageGenerationResult:
-        request = fallback.request
+        request = await self._fit_image_request(fallback.request)
+        diagnostics = {
+            **diagnostics,
+            **self._image_prompt_diagnostics(request),
+            "fallback_prompt_compressed": (
+                len(request.prompt) < len(fallback.request.prompt)
+            ),
+        }
         log_event(
             "provider.image_fallback_started",
             provider=request.provider,
@@ -4421,108 +4518,120 @@ class MediaService:
         )
         return source_message, narrator_message_count
 
-    async def _draft_image_prompt(
+    def _scene_prompt_brief(
         self,
         *,
         save_id: str,
         source_message_id: str,
         scene_context: str,
-    ) -> str:
-        preferences = _image_prompt_preferences(
-            repositories=self.repositories,
-            save_id=save_id,
+        characters: tuple[CharacterRecord, ...],
+        metadata: dict[str, object] | None,
+    ) -> ImagePromptBrief:
+        source = _source_message(
+            messages=self.repositories.list_messages(save_id),
+            source_message_id=source_message_id,
         )
-        if not preferences:
-            raise ValueError("No image prompt model preference configured")
-        empty_prompt_error: str | None = None
-        for preference in preferences:
-            provider = self.providers.get(preference.provider)
-            if provider is None:
-                raise ValueError(
-                    f"Image prompt provider is unavailable: {preference.provider}"
+        return ImagePromptBrief(
+            purpose="scene",
+            source_moment=source.body if source is not None else "",
+            scene_context=scene_context,
+            subjects=tuple(
+                _image_prompt_subject(character) for character in characters
+            ),
+            references=_image_prompt_references(metadata),
+            style_preset=selected_image_style_preset(
+                self.repositories, save_id=save_id,
+            ),
+        )
+
+    def _character_prompt_brief(
+        self,
+        *,
+        character: CharacterRecord,
+        request_context: _ImageRequestContext,
+        purpose: str,
+        source_moment: str = "",
+        scene_context: str = "",
+        intent: str = "",
+        current_action: str = "",
+        facial_expression: str = "",
+    ) -> ImagePromptBrief:
+        return ImagePromptBrief(
+            purpose=purpose,
+            source_moment=source_moment,
+            scene_context=scene_context,
+            intent=intent,
+            subjects=(replace(
+                _image_prompt_subject(character),
+                current_action=current_action,
+                facial_expression=facial_expression,
+            ),),
+            references=tuple(
+                ImagePromptReference(
+                    character_id=character.id, character_name=character.name,
+                    media_asset_id=asset_id,
                 )
-            if not _model_supports_image_prompt(
-                repositories=self.repositories,
-                provider=preference.provider,
-                model_id=preference.model_id,
-            ):
-                log_event(
-                    "media.image_prompt_preference_skipped",
-                    save_id=save_id,
-                    source_message_id=source_message_id,
-                    provider=preference.provider,
-                    model=preference.model_id,
-                    reason="model_lacks_chat_capability",
-                )
+                for asset_id in request_context.source_media_asset_ids
+            ),
+            style_preset=selected_image_style_preset(
+                self.repositories, save_id=character.save_id,
+            ),
+        )
+
+    async def _complete_prepared_brief_clothing(
+        self, *, save_id: str, brief: ImagePromptBrief,
+    ) -> ImagePromptBrief:
+        missing: list[CharacterRecord] = []
+        for subject in brief.subjects:
+            if subject.current_clothing.strip():
                 continue
-            response = await chat_with_fallback(
-                repositories=self.repositories,
-                providers=self.providers,
-                save_id=save_id,
-                task="image_prompt",
-                request=ChatRequest(
-                    provider=preference.provider,
-                    model_id=preference.model_id,
-                    prompt_purpose=ChatPromptPurpose.IMAGE_PROMPT,
-                    messages=(
-                        ChatMessage(
-                            role="system",
-                            body=(
-                                "Write one concise image-generation prompt for the "
-                                "selected roleplay scene. Include the visible "
-                                "subject, setting, action or pose, facial expression, "
-                                "important objects, lighting, weather, time of "
-                                "day, mood, composition, and continuity "
-                                "constraints when "
-                                "they are supported by the context. Treat the "
-                                "selected scene message as the highest-priority "
-                                "current moment for subject, action, setting, "
-                                "and composition. Use "
-                                "deterministic scene context, active linked facts, "
-                                "older chronicle, "
-                                "scenario setup, and prior image continuity only "
-                                "when they describe visible details for this "
-                                "moment without contradicting the selected scene "
-                                "message. Reject unsupported, "
-                                "internal, "
-                                "private, or future details. Do not specify character "
-                                "clothing or add Wearing directives; the application "
-                                "adds Current Clothing separately. Return plain "
-                                "prompt text with no explanation."
-                            ),
-                        ),
-                    ),
-                    current_scene_recap=(scene_context,),
-                    temperature=0.4,
-                    max_output_tokens=10_000,
-                ),
-            )
-            prompt = response.body.strip()
-            if not prompt:
-                empty_prompt_error = (
-                    "Image prompt model returned empty output: "
-                    f"{response.provider}/{response.model_id}"
-                )
-                log_error_event(
-                    "media.image_prompt_empty",
-                    save_id=save_id,
-                    source_message_id=source_message_id,
-                    provider=response.provider,
-                    model=response.model_id,
-                    scene_context_chars=len(scene_context),
-                )
+            current = self.repositories.get_character(subject.character_id)
+            if current is None or current.save_id != save_id:
                 continue
-            log_event(
-                "media.image_prompt_drafted",
-                save_id=save_id,
-                source_message_id=source_message_id,
-                provider=response.provider,
-                model=response.model_id,
-                scene_context_chars=len(scene_context),
-                prompt_chars=len(prompt),
-            )
-            return prompt
-        raise ValueError(empty_prompt_error or "Image prompt response was empty")
+            # Only locks/persistence identity come from live rows. The image moment
+            # and physical profile remain those captured before the job was queued.
+            missing.append(replace(
+                current, name=subject.name, appearance=subject.appearance,
+                visual_notes=subject.visual_notes, age=subject.age,
+                current_clothing="", role="",
+            ))
+        completed = await self._ensure_current_clothing(
+            save_id=save_id, characters=tuple(missing),
+            image_context="\n\n".join((brief.source_moment, brief.scene_context)),
+            preserve_captured_state=True,
+        )
+        outfits = {character.id: character.current_clothing for character in completed}
+        return replace(brief, subjects=tuple(
+            replace(subject, current_clothing=outfits.get(
+                subject.character_id, subject.current_clothing,
+            ))
+            for subject in brief.subjects
+        ))
+
+    async def _draft_brief(
+        self, *, save_id: str, source_message_id: str,
+        brief: ImagePromptBrief, preference: ModelPreferenceRecord,
+    ) -> str:
+        return await ImagePromptService(
+            repositories=self.repositories, providers=self.providers,
+        ).draft(
+            save_id=save_id, source_message_id=source_message_id, brief=brief,
+            max_prompt_chars=image_prompt_max_chars(
+                self.repositories, provider=preference.provider,
+                model_id=preference.model_id, has_references=bool(brief.references),
+            ),
+        )
+
+    async def _draft_image_prompt(
+        self, *, save_id: str, source_message_id: str, scene_context: str,
+    ) -> str:
+        # Compatibility for the existing internal video drafting path.
+        return await ImagePromptService(
+            repositories=self.repositories, providers=self.providers,
+        ).draft(
+            save_id=save_id, source_message_id=source_message_id,
+            brief=ImagePromptBrief(scene_context=scene_context, style_preset="none"),
+        )
 
     def _build_scene_context(
         self,
@@ -4712,39 +4821,6 @@ class MediaService:
         return False
 
 
-def _image_prompt_preferences(
-    *,
-    repositories: PersistenceRepositories,
-    save_id: str,
-) -> tuple[ModelPreferenceRecord, ...]:
-    preferences: list[ModelPreferenceRecord] = []
-    if not shared_roleplay_models_enabled(repositories):
-        save = repositories.get_save(save_id)
-        scenario = repositories.get_scenario(save.scenario_id) if save else None
-        scenario_type = scenario.type if scenario else None
-        scenario_task = (
-            roleplay_model_task(roleplay_type=scenario_type, purpose="image_prompt")
-            if scenario_type in ROLEPLAY_TYPES
-            else None
-        )
-        if scenario_task is not None:
-            scenario_preference = repositories.get_model_preference(scenario_task)
-            if scenario_preference is not None:
-                preferences.append(scenario_preference)
-    preferences.extend(_shared_image_prompt_preferences(repositories))
-    return tuple(_deduplicate_model_preferences(preferences))
-
-
-def _shared_image_prompt_preferences(
-    repositories: PersistenceRepositories,
-) -> tuple[ModelPreferenceRecord, ...]:
-    return tuple(
-        preference
-        for task in ("image_prompt", "chat")
-        if (preference := repositories.get_model_preference(task)) is not None
-    )
-
-
 def _is_text_message_beat(body: str) -> bool:
     normalized = body.casefold()
     if not any(token in normalized for token in ("text", "phone", "screen")):
@@ -4775,18 +4851,40 @@ def _is_text_message_beat(body: str) -> bool:
     return not any(term in normalized for term in scenic_terms)
 
 
-def _deduplicate_model_preferences(
-    preferences: list[ModelPreferenceRecord],
-) -> list[ModelPreferenceRecord]:
-    seen: set[tuple[str, str]] = set()
-    unique: list[ModelPreferenceRecord] = []
-    for preference in preferences:
-        key = (preference.provider, preference.model_id)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(preference)
-    return unique
+def _image_prompt_subject(
+    character: CharacterRecord, *, reusable_reference: bool = False,
+) -> ImagePromptSubject:
+    return ImagePromptSubject(
+        character_id=character.id, name=character.name,
+        appearance=character.appearance, visual_notes=character.visual_notes,
+        age=character.age,
+        current_clothing="" if reusable_reference else character.current_clothing,
+    )
+
+
+def _image_prompt_references(
+    metadata: dict[str, object] | None,
+) -> tuple[ImagePromptReference, ...]:
+    context = metadata or {}
+    asset_ids = context.get("source_character_reference_asset_ids")
+    character_ids = context.get("source_character_reference_character_ids")
+    character_names = context.get("source_character_reference_character_names")
+    if not isinstance(asset_ids, list):
+        return ()
+    if not isinstance(character_ids, list):
+        character_ids = [context.get("character_id")]
+    if not isinstance(character_names, list):
+        character_names = [context.get("character_name")]
+    return tuple(
+        ImagePromptReference(
+            character_id=character_id, character_name=name, media_asset_id=asset_id,
+        )
+        for asset_id, character_id, name in zip(
+            asset_ids, character_ids, character_names, strict=False,
+        )
+        if isinstance(asset_id, str) and isinstance(character_id, str)
+        and isinstance(name, str)
+    )
 
 
 def _source_message(
@@ -4869,37 +4967,11 @@ def _selected_scene_character_references(
     save_id: str,
     source_message_id: str,
 ) -> tuple[_SelectedImageReference, ...]:
-    characters = tuple(repositories.list_characters(save_id))
-    if not characters:
-        return ()
-    characters_by_id = {character.id: character for character in characters}
-    source_message = _source_message(
-        messages=repositories.list_messages(save_id),
-        source_message_id=source_message_id,
+    characters = image_scene_characters(
+        repositories, save_id=save_id, source_message_id=source_message_id,
     )
-    source_text = source_message.body if source_message is not None else ""
-    candidate_ids: list[str] = []
-    seen_character_ids: set[str] = set()
-
-    snapshot = repositories.get_scene_snapshot(save_id)
-    present_character_ids = snapshot.present_character_ids if snapshot else ()
-    for character_id in present_character_ids:
-        if character_id not in characters_by_id or character_id in seen_character_ids:
-            continue
-        candidate_ids.append(character_id)
-        seen_character_ids.add(character_id)
-
-    for character in characters:
-        if character.id in seen_character_ids:
-            continue
-        if not character_name_is_mentioned(
-            name=character.name,
-            aliases=character.aliases,
-            text=source_text,
-        ):
-            continue
-        candidate_ids.append(character.id)
-        seen_character_ids.add(character.id)
+    characters_by_id = {character.id: character for character in characters}
+    candidate_ids = [character.id for character in characters]
 
     references: list[_SelectedImageReference] = []
     seen_media_asset_ids: set[str] = set()
@@ -5212,6 +5284,28 @@ def _image_asset_metadata(
     generation: _ImageGenerationResult,
 ) -> dict[str, object]:
     result = dict(metadata or {})
+    if generation.request.allow_prompt_compression:
+        result["image_prompt"] = {
+            "version": 1,
+            "submitted_chars": len(generation.request.prompt),
+            "max_chars": generation.diagnostics.get("image_prompt_max_chars"),
+            "fallback_compressed": generation.diagnostics.get(
+                "fallback_prompt_compressed", False,
+            ),
+        }
+        if generation.request.image_prompt_brief is not None:
+            brief = ImagePromptBrief.from_json(generation.request.image_prompt_brief)
+            if "source_character_reference_asset_ids" in result:
+                result["source_character_reference_asset_ids"] = [
+                    reference.media_asset_id for reference in brief.references
+                ]
+            if "source_character_reference_character_ids" in result:
+                result["source_character_reference_character_ids"] = [
+                    reference.character_id for reference in brief.references
+                ]
+                result["source_character_reference_character_names"] = [
+                    reference.character_name for reference in brief.references
+                ]
     source_content_rating = result.get("content_rating")
     ratings = [generation.request.content_rating]
     if isinstance(source_content_rating, str):
@@ -5410,68 +5504,6 @@ def _first_narrator_message_id(messages: list[MessageRecord]) -> str | None:
     return None
 
 
-def _scene_character_visual_directions(
-    *,
-    repositories: PersistenceRepositories,
-    save_id: str,
-    source_message_id: str,
-    action_context: str,
-) -> str:
-    return "\n\n".join(
-        part
-        for character in _scene_characters(
-            repositories=repositories,
-            save_id=save_id,
-            source_message_id=source_message_id,
-        )
-        if (
-            part := _character_visual_direction_block(
-                character,
-                action_context=action_context,
-            )
-        )
-    )
-
-
-def _scene_characters(
-    *,
-    repositories: PersistenceRepositories,
-    save_id: str,
-    source_message_id: str,
-) -> tuple[CharacterRecord, ...]:
-    characters = tuple(repositories.list_characters(save_id))
-    if not characters:
-        return ()
-    characters_by_id = {character.id: character for character in characters}
-    source_message = _source_message(
-        messages=repositories.list_messages(save_id),
-        source_message_id=source_message_id,
-    )
-    source_text = source_message.body if source_message is not None else ""
-    selected: list[CharacterRecord] = []
-    seen_character_ids: set[str] = set()
-    for character_id in _present_character_ids_for_message(
-        repositories=repositories,
-        save_id=save_id,
-        source_message_id=source_message_id,
-    ):
-        character = characters_by_id.get(character_id)
-        if character is None or character_id in seen_character_ids:
-            continue
-        selected.append(character)
-        seen_character_ids.add(character_id)
-    for character in characters:
-        if character.id in seen_character_ids or not character_name_is_mentioned(
-            name=character.name,
-            aliases=character.aliases,
-            text=source_text,
-        ):
-            continue
-        selected.append(character)
-        seen_character_ids.add(character.id)
-    return tuple(selected)
-
-
 def _current_clothing_completion_schema() -> dict[str, object]:
     return {
         "type": "object",
@@ -5586,178 +5618,6 @@ def _normalized_visual_comparison(value: str) -> str:
     return " ".join(re.findall(r"\w+", value.casefold()))
 
 
-def _prompt_with_current_clothing_direction(
-    prompt: str,
-    *,
-    character: CharacterRecord,
-) -> str:
-    clothing = _visual_direction_field(character.current_clothing)
-    marker = f"Character visual direction for {character.name}:"
-    cleaned_prompt = _without_wearing_directives(prompt)
-    lines = cleaned_prompt.splitlines()
-    if not clothing or marker.casefold() not in cleaned_prompt.casefold():
-        return "\n".join(lines)
-    for index, line in enumerate(lines):
-        if line.strip().casefold() == marker.casefold():
-            lines.insert(
-                index + 1,
-                f"Wearing: {_ensure_terminal_punctuation(clothing)}",
-            )
-            return "\n".join(lines)
-    return "\n".join(
-        (
-            *lines,
-            "",
-            marker,
-            f"Wearing: {_ensure_terminal_punctuation(clothing)}",
-        )
-    )
-
-
-def _without_wearing_directives(value: str) -> str:
-    without_wearing = re.sub(
-        r"(?i)\bwearing\s*:[^\n]*",
-        "",
-        value,
-    )
-    return "\n".join(line.rstrip() for line in without_wearing.splitlines()).strip()
-
-
-def _prompt_with_character_visual_directions(
-    prompt: str,
-    character_visual_directions: str,
-) -> str:
-    prompt = _without_wearing_directives(prompt)
-    if not character_visual_directions.strip():
-        return prompt
-    if character_visual_directions.strip() in prompt:
-        return prompt
-    return f"{prompt.strip()}\n\n{character_visual_directions.strip()}"
-
-
-def _has_character_visual_direction(text: str) -> bool:
-    return "character visual direction for " in text.casefold()
-
-
-def _character_visual_direction_block(
-    character: CharacterRecord,
-    *,
-    action_context: str = "",
-    expression_context: str = "",
-    action_fallback: str = "natural pose supported by the current context",
-    expression_fallback: str = (
-        "expression grounded in this moment; infer from the selected action, "
-        "mood, and dialogue without contradicting context"
-    ),
-    stable_identity: bool = False,
-) -> str:
-    wearing = (
-        _character_stable_wearing_direction(character)
-        if stable_identity
-        else _character_wearing_direction(character)
-    )
-    action = _visual_direction_field(action_context) or action_fallback
-    expression = _visual_direction_field(expression_context) or expression_fallback
-    lines = [f"Character visual direction for {character.name}:"]
-    if wearing:
-        lines.append(f"Wearing: {_ensure_terminal_punctuation(wearing)}")
-    lines.extend(
-        (
-            f"Current action/pose: {_ensure_terminal_punctuation(action)}",
-            f"Facial expression: {_ensure_terminal_punctuation(expression)}",
-        )
-    )
-    return _compact_text(
-        "\n".join(lines),
-        max_chars=_CHARACTER_VISUAL_DIRECTION_MAX_CHARS,
-        label="character visual direction",
-    )
-
-
-def _character_wearing_direction(character: CharacterRecord) -> str:
-    return _visual_direction_field(character.current_clothing)
-
-
-def _character_stable_wearing_direction(character: CharacterRecord) -> str:
-    for value in (
-        character.visual_notes,
-        character.appearance,
-    ):
-        text = _visual_direction_field(value)
-        if text:
-            return text
-    return "consistent with established stable character appearance"
-
-
-def _visual_direction_field(value: object) -> str:
-    if not isinstance(value, str):
-        return ""
-    text = " ".join(value.strip().split())
-    if not text:
-        return ""
-    if len(text) <= _CHARACTER_VISUAL_DIRECTION_FIELD_MAX_CHARS:
-        return text
-    return (
-        text[: _CHARACTER_VISUAL_DIRECTION_FIELD_MAX_CHARS - 3].rstrip()
-        + "..."
-    )
-
-
-def _ensure_terminal_punctuation(text: str) -> str:
-    stripped = text.strip()
-    if not stripped:
-        return ""
-    if stripped[-1] in ".!?":
-        return stripped
-    return f"{stripped}."
-
-
-def _character_reference_prompt(character: CharacterRecord) -> str:
-    parts = [
-        f"Character reference portrait for {character.name}.",
-        "Create a consistent reusable reference image of this roleplay character.",
-        "Focus on stable visible identity, face, build, hair, eyes, clothing, "
-        "posture, and overall presence. Keep the background simple and avoid "
-        "adding new story events.",
-        _character_visual_direction_block(
-            character,
-            action_fallback="stable reusable reference portrait pose",
-            expression_fallback="neutral, reusable character-reference expression",
-            stable_identity=True,
-        ),
-    ]
-    visual_fields = _deduplicated_character_reference_fields(
-        (
-            ("Age", character.age),
-            ("Appearance", character.appearance),
-            ("Visual notes", character.visual_notes),
-        )
-    )
-    if not visual_fields:
-        visual_fields = _deduplicated_character_reference_fields(
-            (("Character cue", character.role),)
-        )
-
-    field_max_chars = (
-        _CHARACTER_REFERENCE_SINGLE_FIELD_MAX_CHARS
-        if len(visual_fields) <= 1
-        else _CHARACTER_REFERENCE_MULTI_FIELD_MAX_CHARS
-    )
-    if visual_fields and visual_fields[0][0] == "Character cue":
-        field_max_chars = _CHARACTER_REFERENCE_FALLBACK_FIELD_MAX_CHARS
-
-    for label, text in visual_fields:
-        parts.append(
-            f"{label}: "
-            f"{_compact_reference_prompt_field(text, max_chars=field_max_chars)}"
-        )
-    return _compact_text(
-        "\n\n".join(parts),
-        max_chars=_CHARACTER_REFERENCE_PROMPT_MAX_CHARS,
-        label="character reference prompt",
-    )
-
-
 def _character_reference_appearance_system_prompt() -> str:
     return (
         "Write concise natural prose describing only the character's stable physical "
@@ -5824,198 +5684,6 @@ def _character_text_uploaded_photo_description_prompt(
             text_line,
         )
         if line
-    )
-
-
-def _solo_character_scene_image_prompt(
-    *,
-    character: CharacterRecord,
-    character_name: str,
-    action_context: str,
-    scene_context: str,
-) -> str:
-    visual_direction = _character_visual_direction_block(
-        character,
-        action_context=action_context,
-    )
-    return _compact_text(
-        "\n\n".join(
-            (
-                f"Create a solo image of {character_name} in this roleplay moment.",
-                "Use the source reference image as the identity anchor. Preserve the "
-                "same face, build, hair, visible age cues, and recognizable "
-                "character identity.",
-                "Show only this one character. Do not include other people, crowds, "
-                "companions, duplicate versions of the character, reflections that "
-                "show extra people, or background figures.",
-                "Use the selected scene context only for pose, expression, action, "
-                "lighting, setting, mood, weather, props, and composition. Ignore "
-                "private, hidden, unsupported, or future details.",
-                visual_direction,
-                f"Scene context:\n{scene_context}",
-            )
-        ),
-        max_chars=_CHARACTER_IMAGE_PROMPT_MAX_CHARS,
-        label="character image prompt",
-    )
-
-
-def _solo_character_text_image_prompt(
-    *,
-    character: CharacterRecord,
-    character_name: str,
-    text_body: str,
-    visual_prompt: str,
-    scene_context: str,
-) -> str:
-    visual_direction = (
-        ""
-        if _has_character_visual_direction(visual_prompt)
-        else _character_visual_direction_block(
-            character,
-            action_context=visual_prompt or text_body,
-        )
-    )
-    return _compact_text(
-        "\n\n".join(
-            part
-            for part in (
-                f"Create an in-world picture text from {character_name}.",
-                "Use the source reference image as the identity anchor. Preserve the "
-                "same face, build, hair, visible age cues, and recognizable "
-                "character identity.",
-                "Show only this one character. This can be a selfie, outfit check, "
-                "expression, pose, or current appearance update when supported.",
-                "Do not include other people, crowds, companions, duplicate versions "
-                "of the character, reflections that show extra people, or background "
-                "figures.",
-                "Use only visual details supported by the text conversation and "
-                "local world context. Ignore private, hidden, unsupported, or future "
-                "details.",
-                visual_direction,
-                f"NPC text message:\n{text_body.strip()}",
-                f"Requested picture:\n{visual_prompt.strip()}",
-                f"Context:\n{scene_context.strip()}",
-            )
-            if part.strip()
-        ),
-        max_chars=_CHARACTER_IMAGE_PROMPT_MAX_CHARS,
-        label="character text image prompt",
-    )
-
-
-def _object_context_text_image_prompt(
-    *,
-    character_name: str,
-    text_body: str,
-    visual_prompt: str,
-    scene_context: str,
-) -> str:
-    return _compact_text(
-        "\n\n".join(
-            (
-                f"Create an in-world picture attachment sent by {character_name}.",
-                "Depict the concrete object, clue, document, gift, location detail, "
-                "food, ticket, note, or other visible subject that the text message "
-                "is about.",
-                "Do not depict a phone screenshot, chat UI, captions, watermarks, "
-                "or readable body text unless the requested subject is itself a "
-                "document or note.",
-                "Ground every visual detail in the text conversation and local world "
-                "context. Ignore private, hidden, unsupported, or future details.",
-                f"NPC text message:\n{text_body.strip()}",
-                f"Requested picture:\n{visual_prompt.strip()}",
-                f"Context:\n{scene_context.strip()}",
-            )
-        ),
-        max_chars=_CHARACTER_IMAGE_PROMPT_MAX_CHARS,
-        label="character text object image prompt",
-    )
-
-
-def _solo_character_registry_image_prompt(
-    *,
-    character: CharacterRecord,
-    character_name: str,
-    instructions: str,
-) -> str:
-    cleaned_instructions = instructions.strip()
-    visual_direction = _character_visual_direction_block(
-        character,
-        action_context=cleaned_instructions,
-        action_fallback="stable solo character-picture pose",
-    )
-    parts = [
-        f"Create a solo image of {character_name}.",
-        "Use the source reference image as the identity anchor. Preserve the same "
-        "face, build, hair, visible age cues, and recognizable character identity.",
-        "Show only this one character. Do not include other people, crowds, "
-        "companions, duplicate versions of the character, reflections that show "
-        "extra people, or background figures.",
-        "This is a generated character picture for the registry; do not replace or "
-        "redesign the reference identity.",
-        visual_direction,
-    ]
-    if cleaned_instructions:
-        parts.append(f"User instructions: {cleaned_instructions}")
-    return _compact_text(
-        "\n\n".join(parts),
-        max_chars=_CHARACTER_IMAGE_PROMPT_MAX_CHARS,
-        label="character image prompt",
-    )
-
-
-def _deduplicated_character_reference_fields(
-    fields: Iterable[tuple[str, object]],
-) -> list[tuple[str, str]]:
-    selected: list[tuple[str, str, str]] = []
-    for label, value in fields:
-        text = _reference_prompt_text(value)
-        normalized = _normalized_reference_prompt_text(text)
-        if not normalized:
-            continue
-
-        duplicate_index: int | None = None
-        for index, (_existing_label, _existing_text, existing_normalized) in enumerate(
-            selected
-        ):
-            if (
-                normalized == existing_normalized
-                or normalized in existing_normalized
-                or existing_normalized in normalized
-            ):
-                duplicate_index = index
-                break
-        if duplicate_index is None:
-            selected.append((label, text, normalized))
-            continue
-        if len(normalized) > len(selected[duplicate_index][2]):
-            selected[duplicate_index] = (label, text, normalized)
-    return [(label, text) for label, text, _normalized in selected]
-
-
-def _reference_prompt_text(value: object) -> str:
-    return " ".join(str(value).split())
-
-
-def _normalized_reference_prompt_text(text: str) -> str:
-    return " ".join(text.casefold().split())
-
-
-def _compact_reference_prompt_field(text: str, *, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    return f"{text[: max_chars - 3].rstrip()}..."
-
-
-def _image_to_image_prompt(prompt: str, *, reference_count: int = 1) -> str:
-    noun = "image" if reference_count == 1 else "images"
-    return (
-        f"Use the attached character reference {noun} as visual identity "
-        "references. Preserve each referenced character's stable face, body type, "
-        "hair, eyes, visible traits, and styling while depicting the requested "
-        "scene.\n\n"
-        f"{prompt.strip()}"
     )
 
 
@@ -6331,29 +5999,6 @@ def _image_fallback_candidate_tasks(
     if required_capability is ProviderCapability.IMAGE_TO_IMAGE:
         return (_IMAGE_EDIT_FALLBACK_TASK, _IMAGE_FALLBACK_TASK)
     return (_IMAGE_FALLBACK_TASK,)
-
-
-def _model_supports_image_prompt(
-    *,
-    repositories: PersistenceRepositories,
-    provider: str,
-    model_id: str,
-) -> bool:
-    model = find_provider_model(
-        repositories,
-        provider=provider,
-        model_id=model_id,
-    )
-    if model is not None:
-        if not model.available:
-            return False
-        return model_supports_any_capability(
-            repositories,
-            provider=provider,
-            model_id=model_id,
-            required=CHAT_CAPABILITIES | {"text"},
-        )
-    return True
 
 
 def _is_video_provider(provider: object) -> bool:

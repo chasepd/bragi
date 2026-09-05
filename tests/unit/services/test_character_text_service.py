@@ -237,6 +237,7 @@ class RecordingCharacterTextMediaRunner:
         self.repositories = repositories
         self.fail = fail
         self.character_calls: list[tuple[str, str, str]] = []
+        self.character_directions: list[tuple[str, str]] = []
         self.object_calls: list[tuple[str, str, str]] = []
         self.upload_calls: list[tuple[str, bytes, str | None]] = []
         self.cleanup_calls: list[str] = []
@@ -297,11 +298,14 @@ class RecordingCharacterTextMediaRunner:
         character: CharacterRecord,
         visual_prompt: str,
         scene_context: str,
+        current_action: str = "",
+        facial_expression: str = "",
         retry_progress_callback: object | None = None,
         current_user_id: str | None = None,
     ) -> MediaAssetRecord:
         del retry_progress_callback, current_user_id
         self.character_calls.append((text_message.id, visual_prompt, scene_context))
+        self.character_directions.append((current_action, facial_expression))
         if self.fail:
             raise RuntimeError("image provider failed")
         return self._create_asset(
@@ -380,6 +384,8 @@ class BlockingCharacterTextMediaRunner(RecordingCharacterTextMediaRunner):
         character: CharacterRecord,
         visual_prompt: str,
         scene_context: str,
+        current_action: str = "",
+        facial_expression: str = "",
         retry_progress_callback: object | None = None,
         current_user_id: str | None = None,
     ) -> MediaAssetRecord:
@@ -391,6 +397,7 @@ class BlockingCharacterTextMediaRunner(RecordingCharacterTextMediaRunner):
             character=character,
             visual_prompt=visual_prompt,
             scene_context=scene_context,
+            current_action=current_action, facial_expression=facial_expression,
             retry_progress_callback=retry_progress_callback,
             current_user_id=current_user_id,
         )
@@ -1585,10 +1592,10 @@ def test_send_text_generates_character_image_attachment_for_npc_reply(
     assert media.character_calls[0][1].startswith(
         "Rowan mirror selfie in a patched denim jacket"
     )
-    assert "Character visual direction for Rowan" in media.character_calls[0][1]
     assert "Wearing:" not in media.character_calls[0][1]
-    assert "Current action/pose: taking a mirror selfie" in media.character_calls[0][1]
-    assert "Facial expression: guarded half-smile" in media.character_calls[0][1]
+    assert media.character_directions == [(
+        "taking a mirror selfie", "guarded half-smile",
+    )]
     assert "Found my old jacket" in media.character_calls[0][2]
     request = next(
         request
