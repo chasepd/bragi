@@ -15,7 +15,7 @@ from collections.abc import (
     Iterable,
     Mapping,
 )
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
@@ -2702,6 +2702,55 @@ class BragiRuntime:
             status="Character reference image updated",
             active_save_id=save_id,
         )
+
+    async def upload_character_image(
+        self,
+        *,
+        character_id: str,
+        image_bytes: bytes,
+        filename: str | None = None,
+        active_save_id: str | None | object = ...,
+        mutation_context: (
+            Callable[[], AbstractAsyncContextManager[None]] | None
+        ) = None,
+    ) -> RuntimeModel:
+        save_id = (
+            self.active_save_id
+            if active_save_id is ...
+            else cast(str | None, active_save_id)
+        )
+        if save_id is None:
+            return self.build_model(error="No save loaded", active_save_id=save_id)
+
+        try:
+            async with mutation_context() if mutation_context else nullcontext():
+                async with self._save_operation_lock(save_id):
+                    asset = self._media_service().upload_character_image(
+                        save_id=save_id,
+                        character_id=character_id,
+                        image_bytes=image_bytes,
+                        filename=filename,
+                    )
+                    model = self.build_model(
+                        status="Character image uploaded", active_save_id=save_id,
+                    )
+        except Exception as exc:
+            log_error_event(
+                "runtime.character_image_upload_failed",
+                save_id=save_id,
+                character_id=character_id,
+                **exception_log_fields(exc),
+            )
+            return self.build_model(
+                error=_user_visible_error(exc), active_save_id=save_id,
+            )
+        log_event(
+            "runtime.character_image_uploaded",
+            save_id=save_id,
+            character_id=character_id,
+            media_asset_id=asset.id,
+        )
+        return model
 
     async def upload_character_reference_image(
         self,

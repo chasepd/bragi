@@ -792,7 +792,7 @@ def _request_body_limit_bytes(scope: Scope, *, default_limit: int) -> int:
         )
         or (
             path.startswith("/api/characters/")
-            and path.endswith("/reference-image/upload")
+            and path.endswith(("/reference-image/upload", "/image/upload"))
         )
     ):
         return (
@@ -5302,6 +5302,47 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             save_id=save_id,
         )
 
+    @app.post("/api/characters/{character_id}/image/upload")
+    async def upload_character_gallery_image(
+        character_id: str,
+        state: StateDep,
+        file: Annotated[UploadFile, File()],
+        save_id: Annotated[str | None, Form()] = None,
+    ) -> dict[str, Any]:
+        resolved_save_id = _require_save_id(save_id)
+        async with state.lock.async_access():
+            _raise_unless_save_action_allowed(state, resolved_save_id, "media")
+            _raise_unless_unrated_reference_upload(
+                state, image_description="character image",
+            )
+        try:
+            image_bytes = await _read_limited_character_reference_upload(file)
+        except _CharacterReferenceUploadTooLarge as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        model = await state.runtime.upload_character_image(
+            image_bytes=image_bytes,
+            filename=file.filename,
+            character_id=character_id,
+            active_save_id=resolved_save_id,
+            mutation_context=state.lock.async_access,
+        )
+        if _runtime_model_error(model):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Character image upload failed. Try again or check diagnostics "
+                    "for details."
+                ),
+            )
+        async with state.lock.async_access():
+            payload_dict = _character_registry_json_or_raise(
+                state, save_id=resolved_save_id,
+            )
+        _publish_runtime_changed_from_model_result(
+            state, payload_dict, reason="character_image_uploaded",
+        )
+        return payload_dict
+
     @app.post("/api/characters/{character_id}/reference-image/upload")
     async def upload_character_reference_image_for_character(
         character_id: str,
@@ -7118,14 +7159,18 @@ def _raise_unless_persistent_world_rating_allowed(
         )
 
 
-def _raise_unless_unrated_reference_upload(state: WebAppState) -> None:
+def _raise_unless_unrated_reference_upload(
+    state: WebAppState,
+    *,
+    image_description: str = "reference image",
+) -> None:
     if _content_safety_policy_for_request(state).rating == "unrated":
         return
     raise HTTPException(
         status_code=400,
         detail=(
             "Uploaded images cannot be safety-reviewed. Set the content rating "
-            "to Unrated before uploading a reference image."
+            f"to Unrated before uploading a {image_description}."
         ),
     )
 

@@ -101,6 +101,7 @@ or per user/session before using a save ID.
 | `/api/runtime/world-time` | Save-scoped | Correct the current in-world time only for an accessible save; child allowed for owned or assigned saves. |
 | `/api/saves` | Authenticated | List saves visible to the current user. |
 | `/api/saves/{save_id}/chronicle` | Save-scoped | Read paged chronicle messages only for an accessible save. |
+| `/api/saves/{save_id}/chronicle/head` | Save-scoped | Read the latest chronicle message ID only for an accessible save. |
 | `/api/saves/{save_id}/media` | Save-scoped | Read scene media history only for an accessible save. |
 | `/api/saves/{save_id}/engine-health` | Save-scoped | Read metadata-only engine diagnostics for an accessible save; child blocked. |
 | `/api/chat-history` | Save-scoped | Read history only for an accessible save. |
@@ -181,6 +182,7 @@ or per user/session before using a save ID.
 | `/api/world-data/guided-cleanup` | Save-scoped | Guided cleanup only accessible saves; child blocked. |
 | `/api/characters` | Save-scoped | Read characters only for an accessible save. |
 | `/api/characters/{character_id}/image/generate` | Save-scoped | Generate a registry picture from an existing character reference image in an accessible save. Child content safeguards apply. |
+| `/api/characters/{character_id}/image/upload` | Save-scoped | Upload a gallery picture for a character in an accessible save without changing its reference or appearance; child blocked and Unrated required. |
 | `/api/characters/{character_id}/reference-image/generate` | Save-scoped | Generate only for characters in an accessible save. Child content safeguards apply. |
 | `/api/characters/{character_id}/reference-image/upload` | Save-scoped | Upload only for characters in an accessible save; child blocked. |
 | `/api/characters/{character_id}/reference-image/set` | Save-scoped | Set only for characters in an accessible save; child blocked. |
@@ -219,6 +221,7 @@ or per user/session before using a save ID.
 | `/api/persistent-world-bundles/preview` | Authenticated | Preview persistent-world import; child users are blocked. |
 | `/api/persistent-world-bundles/import/{preview_id}` | User-scoped | Import only a persistent-world preview created by this user/session. |
 | `POST /api/bundles/export` | Save-scoped | Queue an export only for an accessible save; child blocked. |
+| `GET /api/bundles/export/ready` | Save-scoped | Check for a ready export only for an accessible save; child blocked. |
 | `GET /api/bundles/export/{job_id}/download` | Save-scoped | Download only a completed export job for an accessible save; child blocked. |
 | `/api/story-logs/export` | Save-scoped | Export only the story log for an accessible save; child blocked. |
 | `/api/jobs` | Authenticated | List only jobs visible to the current user. |
