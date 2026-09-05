@@ -109,6 +109,7 @@ secure cookies as described in `docs/docker-compose.md`.
 
 More deployment notes are in `docs/docker-compose.md`.
 The full auth policy is in `docs/auth-policy.md`.
+Chat conventions, including fenced song lyrics, are in [Chat formatting](docs/chat-formatting.md).
 Troubleshooting guidance is in `docs/troubleshooting.md`.
 Privacy review guidance for checked-in fixtures and documentation is in
 `docs/privacy-review.md`.
