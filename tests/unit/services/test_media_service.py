@@ -10234,10 +10234,15 @@ def test_historical_solo_image_omits_later_character_profile_changes(
         last_updated_message_id=later.id,
     ))
     media_dir = tmp_path / "media"
-    _persist_character_reference(
+    reference = _persist_character_reference(
         repositories, media_dir=media_dir, save_id=save.id,
         source_message_id=opening.id, character_id=character_id,
     )
+    repositories.connection.execute(
+        "UPDATE media_assets SET created_at = ? WHERE id = ?",
+        (opening.created_at, reference.id),
+    )
+    repositories.commit()
     repositories.set_model_preference(
         task="image_to_image_generation", provider="fake", model_id="fake-edit",
     )
