@@ -83,3 +83,25 @@ it("clears lyrics fences while preserving literal lyric punctuation", async () =
 
   expect(textarea).toHaveValue("I sing.\n*Stay*\n> with me\n```python\nplay()\n```");
 });
+
+it("toggles a lyrics selection that includes the newline after its closing fence", async () => {
+  const { textarea } = renderComposer();
+  const block = "```lyrics\n*Stay*\n> with me\n```";
+  fireEvent.change(textarea, { target: { value: `${block}\n*I pause.*` } });
+  textarea.setSelectionRange(0, block.length + 1);
+  await userEvent.click(screen.getByRole("button", { name: "Format as lyrics" }));
+
+  expect(textarea).toHaveValue("*Stay*\n> with me\n*I pause.*");
+});
+
+it.each([
+  [0, 25, "I sing.\n*Stay*\n> with me\n*I pause.*"],
+  [22, 51, "*I sing.*\n*Stay*\n> with me\nI pause."]
+])("clears a selection crossing a lyrics boundary without damaging the verse (%i, %i)", async (start, end, expected) => {
+  const { textarea } = renderComposer();
+  fireEvent.change(textarea, { target: { value: "*I sing.*\n```lyrics\n*Stay*\n> with me\n```\n*I pause.*" } });
+  textarea.setSelectionRange(start, end);
+  await userEvent.click(screen.getByRole("button", { name: "Clear roleplay formatting" }));
+
+  expect(textarea).toHaveValue(expected);
+});

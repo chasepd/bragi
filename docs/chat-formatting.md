@@ -34,6 +34,8 @@ while the message field is focused. The action wraps the selected lines; with
 no selection, it wraps the current line or inserts an empty block. Use it again
 inside a lyrics block to remove the fences. **Clear roleplay formatting**
 (**Alt+0**) also removes lyrics fences while preserving the verse's punctuation.
+Selections crossing a lyrics boundary include the whole block when removing
+fences, so a partial selection cannot leave an unmatched fence behind.
 
 Surrounding narration establishes the singer, delivery, audience, and whether
 the character performs, writes, or quotes the song. State whether you sing an

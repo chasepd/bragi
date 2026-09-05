@@ -6610,6 +6610,9 @@ def test_focused_scene_tool_prompts_scope_registry_lists(
         for request in provider.tool_call_requests
     ]
     assert len(request_bodies) == 6
+    for request in provider.tool_call_requests:
+        assert "Lyrics convention:" in request.messages[0].body
+        assert "not evidence of literal events" in request.messages[0].body
     assert "Known locations" not in request_bodies[0]
     assert "Known characters" not in request_bodies[0]
     assert "Known locations (showing 24 of 31; 7 omitted)" in request_bodies[1]

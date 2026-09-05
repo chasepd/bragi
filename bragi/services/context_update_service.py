@@ -2318,7 +2318,9 @@ def _focused_scene_tool_messages(
     user: str,
 ) -> tuple[ToolCallMessage, ...]:
     return (
-        ToolCallMessage(role="system", body=system),
+        ToolCallMessage(
+            role="system", body=LYRICS_INTERPRETATION_SECTION + "\n\n" + system,
+        ),
         ToolCallMessage(role="user", body=user),
     )
 

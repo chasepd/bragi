@@ -7368,12 +7368,20 @@ function formatComposerBody(
   if (actionId === "dialogue") return formatComposerWrappedSelection(body, start, end, "\"", "\"");
   if (actionId === "text_message") return formatComposerLineSelection(body, start, end, formatComposerTextMessageLines);
   if (actionId === "lyrics" || actionId === "clear") {
-    for (const match of body.matchAll(/^```lyrics[ \t]*\n([\s\S]*?)\n```[ \t]*(?=\n|$)/gm)) {
-      const blockStart = match.index;
-      const blockEnd = blockStart + match[0].length;
-      if (start >= blockStart && end <= blockEnd) {
-        return replaceComposerRange(body, blockStart, blockEnd, match[1], blockStart, blockStart + match[1].length);
-      }
+    const lyricsPattern = /^[ \t]*```lyrics[ \t]*\n([\s\S]*?)\n[ \t]*```[ \t]*(?=\n|$)/gm;
+    const overlapping = [...body.matchAll(lyricsPattern)].filter((match) => start === end
+      ? start >= match.index && start <= match.index + match[0].length
+      : start < match.index + match[0].length && end > match.index);
+    if (overlapping.length) {
+      const first = overlapping[0];
+      const last = overlapping[overlapping.length - 1];
+      const rangeStart = Math.min(start, first.index);
+      const rangeEnd = Math.max(end, last.index + last[0].length);
+      const selected = body.slice(rangeStart, rangeEnd);
+      const replacement = actionId === "lyrics"
+        ? selected.replace(lyricsPattern, "$1")
+        : clearComposerRoleplayFormatting(selected);
+      return replaceComposerRange(body, rangeStart, rangeEnd, replacement, rangeStart, rangeStart + replacement.length);
     }
   }
   if (actionId === "lyrics") {
