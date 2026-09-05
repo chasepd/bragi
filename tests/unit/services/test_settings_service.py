@@ -184,6 +184,44 @@ class MetadataRecordingProvider(RecordingProvider):
         )
 
 
+class ImageLimitRecordingProvider(RecordingProvider):
+    async def list_models_with_metadata(self) -> ProviderModelListResponse:
+        return ProviderModelListResponse(
+            models=self.models,
+            raw_metadata={
+                "data": [
+                    {
+                        "id": "google/gemini-2.5-flash-image-preview",
+                        "prompt_character_limit": 12000,
+                    }
+                ]
+            },
+        )
+
+
+def test_refresh_provider_models_caches_prompt_limits(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.set_app_setting(
+        "image_prompt_model_limits",
+        {"openrouter": {"stale-image": 1000}, "venice": {"hidream": 4000}},
+    )
+    service = SettingsService(
+        repositories=repositories,
+        providers={"openrouter": ImageLimitRecordingProvider()},
+        secret_store=InMemorySecretStore(),
+    )
+    service.set_provider_api_key("openrouter", "test-secret")
+
+    result = asyncio.run(service.refresh_provider_models("openrouter"))
+
+    assert result.error is None
+    assert repositories.get_app_setting("image_prompt_model_limits") == {
+        "openrouter": {"google/gemini-2.5-flash-image-preview": 12000},
+        "venice": {"hidream": 4000},
+    }
+
+
 class RecordingVideoProvider(RecordingProvider):
     async def generate_video(self, request: VideoRequest) -> VideoResponse:
         return VideoResponse(

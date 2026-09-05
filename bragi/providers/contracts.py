@@ -292,6 +292,10 @@ class ImageRequest:
         compare=False,
         repr=False,
     )
+    # Orchestration hints; image adapters never send these fields to providers.
+    allow_prompt_compression: bool = False
+    prompt_required_text: str = ""
+    image_prompt_brief: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

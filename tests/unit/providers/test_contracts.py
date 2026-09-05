@@ -72,6 +72,20 @@ class FakeProvider:
         )
 
 
+def test_image_request_preserves_direct_prompt_by_default() -> None:
+    request = ImageRequest(
+        provider="fake",
+        model_id="fake-image",
+        prompt="A lantern on a table.",
+        source_save_id="save-1",
+        source_message_id="message-1",
+    )
+
+    assert request.allow_prompt_compression is False
+    assert request.prompt_required_text == ""
+    assert request.image_prompt_brief is None
+
+
 class FakeStructuredProvider(FakeProvider):
     async def list_models(self) -> list[ProviderModel]:
         return [
