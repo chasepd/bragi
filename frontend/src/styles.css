@@ -1175,15 +1175,15 @@ h1 {
 
 .chronicle-virtual-list {
   position: relative;
+  display: flex;
+  flex-direction: column;
   flex: 0 0 auto;
   width: 100%;
   min-height: 0;
 }
 
 .chronicle-virtual-row {
-  position: absolute;
-  top: 0;
-  left: 0;
+  position: relative;
   display: flex;
   flex-direction: column;
   width: 100%;

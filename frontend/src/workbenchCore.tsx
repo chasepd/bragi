@@ -6076,6 +6076,13 @@ function Chronicle({
   });
   const virtualChronicleRows = chronicleVirtualizer.getVirtualItems();
   const chronicleTotalSize = chronicleVirtualizer.getTotalSize();
+  // Represent offscreen rows with padding so stale measurements cannot overlap rendered messages.
+  const firstVirtualChronicleRow = virtualChronicleRows[0];
+  const lastVirtualChronicleRow = virtualChronicleRows[virtualChronicleRows.length - 1];
+  const chroniclePaddingStart = firstVirtualChronicleRow?.start ?? 0;
+  const chroniclePaddingEnd = lastVirtualChronicleRow
+    ? Math.max(0, chronicleTotalSize - lastVirtualChronicleRow.end)
+    : 0;
   const chronicleIsNearBottom = useCallback((node: HTMLElement, scrollHeight = node.scrollHeight) => {
     return scrollHeight - node.scrollTop - node.clientHeight <= 96;
   }, []);
@@ -6302,7 +6309,12 @@ function Chronicle({
       {messages.length ? (
         <div
           className="chronicle-virtual-list"
-          style={{ height: `${chronicleTotalSize}px` }}
+          style={{
+            minHeight: `${chronicleTotalSize}px`,
+            paddingTop: `${chroniclePaddingStart}px`,
+            paddingBottom: `${chroniclePaddingEnd}px`,
+            rowGap: `${CHRONICLE_ROW_GAP}px`,
+          }}
         >
           {virtualChronicleRows.map((virtualRow) => {
             const message = messages[virtualRow.index];
@@ -6313,7 +6325,6 @@ function Chronicle({
                 ref={chronicleVirtualizer.measureElement}
                 className="chronicle-virtual-row"
                 data-index={virtualRow.index}
-                style={{ transform: `translateY(${virtualRow.start}px)` }}
               >
                 <ChronicleMessageRow
                   message={message}
