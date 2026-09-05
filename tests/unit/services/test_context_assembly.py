@@ -25,6 +25,7 @@ from bragi.services.context_assembly import (
     pending_context_suggestion_sources,
     scenario_section_candidates,
 )
+from bragi.services.world_data_service import WorldDataService
 
 
 @pytest.fixture
@@ -2367,7 +2368,7 @@ def test_image_historical_presence_does_not_fall_back_to_current_snapshot(
     assert image_scene_characters(repositories, save.id, old.id) == (mara,)
 
 
-def test_image_historical_context_omits_records_updated_after_source(
+def test_image_historical_context_keeps_identity_and_facts_after_later_updates(
     repositories: PersistenceRepositories,
 ) -> None:
     _scenario, save, location = _create_context_save(
@@ -2386,6 +2387,11 @@ def test_image_historical_context_omits_records_updated_after_source(
         source_message_id=old.id,
     )
     repositories.replace_message_scene_presence(save.id, old.id, [mara.id])
+    repositories.upsert_scene_fact(
+        save_id=save.id, fact_type="actor_pose", subject_type="character",
+        subject_id=mara.id, subject_label="Mara", value="hands resting on a brass rail",
+        source_message_id=old.id, evidence_quote="Mara rests her hands on a brass rail",
+    )
     later = repositories.append_message(
         save_id=save.id, role="narrator", body="Time passes."
     )
@@ -2408,7 +2414,14 @@ def test_image_historical_context_omits_records_updated_after_source(
         save_id=save.id, source_message_id=old.id,
     )
 
-    assert image_scene_characters(repositories, save.id, old.id) == ()
+    [historical_character] = image_scene_characters(repositories, save.id, old.id)
+    assert historical_character.id == mara.id
+    assert historical_character.name == "Mara"
+    assert historical_character.appearance == ""
+    assert historical_character.current_clothing == ""
+    assert historical_character.status == ""
+    assert "Present characters: Mara" in context
+    assert "Mara: hands resting on a brass rail" in context
     for future_detail in (
         "freshly shaved", "orange coat", "collapsed ceiling", "collapsed roof"
     ):
@@ -2583,3 +2596,155 @@ def test_historical_image_omits_outfit_inferred_without_message_provenance(
         if not mara_present:
             assert "Discussed/background character profiles" in text
     assert repositories.get_character(mara.id) == updated
+
+
+@pytest.mark.parametrize("location_detail_field", ["description", "visual_description"])
+def test_historical_image_omits_accepted_undated_scene_edits_but_keeps_facts(
+    repositories: PersistenceRepositories,
+    location_detail_field: str,
+) -> None:
+    _scenario, save, location = _create_context_save(
+        repositories, scenario_id="image-accepted-edits", save_id="image-accepted-edits"
+    )
+    first = repositories.append_message(
+        save_id=save.id, role="narrator",
+        body="Mara holds a map beside the gallery window.",
+    )
+    location = repositories.update_location(replace(
+        location, name="Original gallery", visual_description="",
+        source_message_id=first.id,
+    ))
+    mara = repositories.add_character(
+        save_id=save.id, name="Mara", status="standing by the window",
+        location_id=location.id, source_message_id=first.id,
+    )
+    snapshot = repositories.upsert_scene_snapshot(
+        save_id=save.id, current_location_id=location.id,
+        present_character_ids=[mara.id], source_message_id=first.id,
+        situation="Maps cover the table.", time_of_day="morning",
+    )
+    repositories.replace_message_scene_presence(save.id, first.id, [mara.id])
+    fact, _, _ = repositories.upsert_scene_fact(
+        save_id=save.id, fact_type="object_location", subject_type="object",
+        subject_id=None, subject_label="Brass lantern", target_type="location",
+        target_id=location.id, target_label="Original gallery",
+        value="on the east stone ledge", source_message_id=first.id,
+        evidence_quote="A brass lantern stands on the east stone ledge",
+    )
+    later = repositories.append_message(
+        save_id=save.id, role="narrator", body="The following evening arrives.",
+    )
+    repositories.replace_message_scene_presence(save.id, later.id, [mara.id])
+    world_data = WorldDataService(repositories=repositories, active_save_id=save.id)
+    edits: tuple[tuple[str, str, str, object], ...] = (
+        ("character", mara.id, "status", "FUTURE blindfolded and tied to a chair"),
+        ("location", location.id, "name", "FUTURE Flood Chamber"),
+        ("location", location.id, location_detail_field, "FUTURE submerged furniture"),
+        ("location", location.id, "status", "FUTURE inaccessible"),
+        ("location", location.id, "hazards", ["FUTURE unstable walls"]),
+        ("scene_snapshot", snapshot.id, "situation", "FUTURE overturned tables"),
+        ("scene_snapshot", snapshot.id, "objective", "FUTURE escape through a hatch"),
+        ("scene_snapshot", snapshot.id, "weather", "FUTURE heavy rain"),
+        ("scene_snapshot", snapshot.id, "mood", "FUTURE panic"),
+        ("scene_snapshot", snapshot.id, "nearby_objects", ["FUTURE broken mirror"]),
+        ("scene_snapshot", snapshot.id, "hazards", ["FUTURE rising water"]),
+        ("scene_snapshot", snapshot.id, "time_of_day", "night"),
+    )
+    for entity_type, entity_id, field_path, value in edits:
+        suggestion = repositories.add_context_update_suggestion(
+            save_id=save.id, update_type="field_update", entity_type=entity_type,
+            entity_id=entity_id, field_path=field_path, proposed_value=value,
+            reason="Accept a later visible scene detail.", confidence=0.9,
+            source_message_ids=[later.id],
+        )
+        world_data.apply_suggestions([suggestion.id])
+    current_character = repositories.get_character(mara.id)
+    current_location = repositories.get_location(location.id)
+    current_snapshot = repositories.get_scene_snapshot(save.id)
+    assert current_character is not None
+    assert current_location is not None
+    assert current_snapshot is not None
+    for record in (current_character, current_location):
+        assert record.source_message_id == first.id
+        assert record.last_updated_message_id == first.id
+    assert current_snapshot.first_seen_message_id == first.id
+    assert current_snapshot.source_message_id in (None, first.id)
+    assert current_snapshot.last_updated_message_id in (None, first.id)
+
+    assembly = ContextAssemblyService(repositories)
+    historical, breakdown = assembly.build_image_scene_context(
+        save_id=save.id, source_message_id=first.id,
+    )
+    latest, _ = ContextAssemblyService(repositories).build_image_scene_context(
+        save_id=save.id, source_message_id=later.id,
+    )
+
+    assert first.body in historical
+    assert "Present characters: Mara" in historical
+    assert "FUTURE" not in historical
+    assert "Current world time:" not in historical
+    assert "Current location:" not in historical
+    assert "Brass lantern -> Original gallery: on the east stone ledge" in historical
+    assert any(
+        source.source_id == fact.id and source.included for source in breakdown.sources
+    )
+    assert all(source.source_type != "scene_snapshot" for source in breakdown.sources)
+    [historical_character] = image_scene_characters(repositories, save.id, first.id)
+    assert historical_character.status == ""
+    assert historical_character.location_id is None
+    assert image_scene_characters(repositories, save.id, later.id)[0].status == (
+        current_character.status
+    )
+    for detail in (
+        "blindfolded", "FUTURE Flood Chamber", "submerged furniture", "inaccessible",
+        "unstable walls", "overturned tables", "escape through a hatch", "heavy rain",
+        "panic", "broken mirror", "rising water", "Current world time:",
+    ):
+        assert detail in latest
+
+
+
+def test_historical_image_omits_later_effective_scenario_and_selected_sections(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, _location = _create_context_save(
+        repositories, scenario_id="image-evolved-scenario", save_id="image-evolution"
+    )
+    previous = repositories.append_message(
+        save_id=save.id, role="player", body="I raise the brass lantern."
+    )
+    selected = repositories.append_message(
+        save_id=save.id, role="narrator", body="Mara shields the lantern from the rain."
+    )
+    later = repositories.append_message(
+        save_id=save.id, role="narrator", body="Another chapter begins."
+    )
+    repositories.add_save_scenario_update(
+        save_id=save.id, title="FUTURE royal palace",
+        premise="FUTURE gilded courtyards surround the throne",
+        player_role="FUTURE crowned monarch", content={},
+        reason="A later chapter changes the setting.", provider="fake", model="fake",
+        source_message_id=later.id, source_message_ids=(later.id,),
+    )
+    assembly = ContextAssemblyService(repositories)
+    historical, breakdown = assembly.build_image_scene_context(
+        save_id=save.id, source_message_id=selected.id,
+        selected_scenario_sections=("FUTURE ornamental garden surrounds the palace",),
+    )
+    latest, _ = assembly.build_image_scene_context(
+        save_id=save.id, source_message_id=later.id,
+        selected_scenario_sections=("FUTURE ornamental garden surrounds the palace",),
+    )
+
+    assert selected.body in historical
+    assert previous.body in historical
+    assert "Generate a scene image for this roleplay moment." in historical
+    assert "FUTURE" not in historical
+    assert all(
+        source.tier not in {"scenario_header", "scenario_section"}
+        for source in breakdown.sources
+    )
+    for detail in (
+        "royal palace", "gilded courtyards", "crowned monarch", "ornamental garden"
+    ):
+        assert detail in latest

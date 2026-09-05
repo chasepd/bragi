@@ -106,13 +106,19 @@ presence: other mentioned profiles are labeled as discussed/background context.
 Empty presence and absent presence currently share the same persisted shape, so
 both use that latest-message fallback.
 
-Historical frames omit mutable character, location, and scene records with
-updates after the source, or without reliable message provenance. They also omit
-mutable linked lore and template world state rather than reconstructing old
-versions. Current character appearance, visual notes, clothing, and age are omitted
-for historical frames because registry edits and reference uploads can change
-these fields without advancing their message provenance. The selected text still
-supplies visible details. Historical reference images need eligible source-message
+Historical frames retain character identities confirmed by per-message presence,
+even when their current profiles have later provenance. They omit current
+appearance, visual notes, clothing, age, status, and character location. They also
+omit all mutable snapshot details (including time, situation, weather, objects,
+and hazards), location descriptions/status, linked lore, template world state,
+and current effective scenario headers/selected sections that may reflect later
+evolution or manual edits.
+Registry edits, accepted suggestions, and reference uploads can change these
+values without advancing their message provenance. The selected text supplies
+historical visual details; no historical state is reconstructed. Eligible dated
+physical facts remain available through the snapshot's identity and generation,
+using their stored location labels rather than mutable location registry names.
+Historical reference images need eligible source-message
 provenance and a creation timestamp at or before the selected moment; a solo image
 reports an unavailable reference if the currently linked image cannot qualify.
 The narrator's existing cutoff behavior is unchanged. Image profiles
