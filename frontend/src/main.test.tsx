@@ -22085,7 +22085,7 @@ describe("frontend helpers", () => {
       get: function (this: HTMLElement) {
         if (!this.classList.contains("chronicle-scroll")) return 0;
         const virtualList = this.querySelector<HTMLElement>(".chronicle-virtual-list");
-        return Number.parseFloat(virtualList?.style.height ?? "0");
+        return Number.parseFloat(virtualList?.style.minHeight || virtualList?.style.height || "0");
       }
     });
     Object.defineProperty(HTMLElement.prototype, "scrollTo", {
@@ -22709,7 +22709,7 @@ describe("frontend helpers", () => {
       get: function (this: HTMLElement) {
         if (!this.classList.contains("chronicle-scroll")) return 0;
         const virtualList = this.querySelector<HTMLElement>(".chronicle-virtual-list");
-        return Number.parseFloat(virtualList?.style.height ?? "0");
+        return Number.parseFloat(virtualList?.style.minHeight || virtualList?.style.height || "0");
       }
     });
     Object.defineProperty(HTMLElement.prototype, "scrollTo", {
