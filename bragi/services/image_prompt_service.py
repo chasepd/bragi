@@ -148,7 +148,8 @@ _DRAFT_INSTRUCTIONS = (
     "interaction, and the spatial relationships between subjects and objects. "
     "Resolve names and pronouns into explicit visual descriptions so identities "
     "and actions cannot be confused. Describe the relevant foreground, background, "
-    "setting, materials, lighting, weather, and framing in as much useful detail "
+    "setting, materials, lighting, time of day, weather, mood, composition, "
+    "and framing in as much useful detail "
     "as the evidence and available space support. Select one moment, not a montage "
     "or sequence. The selected source moment and confirmed subjects take priority "
     "over supporting context, old events, and scenario setup. Do not depict a "
@@ -184,10 +185,12 @@ _PURPOSE_INSTRUCTIONS = {
         "Depict exactly one subject, the selected character, in a clear solo "
         "picture. Retain relevant surroundings without adding other characters."
     ),
-    "character_selfie": (
-        "Depict the selected character taking a plausible arm's-length selfie. "
-        "Use selfie camera perspective, physically plausible hands and framing, "
-        "and the surroundings relevant to the attachment intent."
+    "character_attachment": (
+        "Depict only the selected character in the in-world picture requested "
+        "by the attachment intent. When it asks for a selfie, use a plausible "
+        "arm's-length selfie or mirror perspective as requested, with physically "
+        "plausible hands and framing. An outfit check or other character picture "
+        "need not be a selfie. Preserve the requested view and surroundings."
     ),
     "object_attachment": (
         "Depict the requested object as the focus of a believable attached "

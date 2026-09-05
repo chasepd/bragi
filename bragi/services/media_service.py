@@ -181,7 +181,6 @@ class _ImageRequestContext:
     source_media_paths: tuple[Path, ...] = ()
     metadata: dict[str, object] | None = None
     request_task: str | None = None
-    character_visual_directions: str = ""
 
 
 @dataclass(frozen=True)
@@ -751,7 +750,6 @@ class MediaService:
             source_media_paths=request_context.source_media_paths,
             metadata=request_context.metadata,
             request_task=request_context.request_task,
-            character_visual_directions=request_context.character_visual_directions,
             current_user_id=current_user_id,
         )
 
@@ -1750,6 +1748,17 @@ class MediaService:
         )
         if character.id not in present_character_ids:
             raise ValueError("Selected character is not present in this scene")
+        eligible = {
+            participant.id: participant
+            for participant in image_scene_characters(
+                self.repositories, save_id=save_id, source_message_id=source_message_id,
+            )
+        }
+        # Historical presence can be known even after the profile was updated.
+        # Keep the requested identity, but do not invent its prior appearance.
+        character = eligible.get(character.id) or replace(
+            character, appearance="", visual_notes="", current_clothing="", age="",
+        )
         preference = self._character_image_preference(save_id=save_id)
         reference = _linked_character_reference_asset(
             repositories=self.repositories,
@@ -1769,13 +1778,14 @@ class MediaService:
             save_id=save_id,
             source_message_id=source_message_id,
         )
-        character = (
-            await self._ensure_current_clothing(
-                save_id=save_id,
-                characters=(character,),
-                image_context=scene_context,
-            )
-        )[0]
+        messages = self.repositories.list_messages(save_id)
+        if messages and messages[-1].id == source_message_id:
+            character = (
+                await self._ensure_current_clothing(
+                    save_id=save_id, characters=(character,),
+                    image_context=scene_context,
+                )
+            )[0]
         brief = self._character_prompt_brief(
             character=character,
             request_context=request_context,
@@ -1918,7 +1928,7 @@ class MediaService:
         brief = self._character_prompt_brief(
             character=character,
             request_context=request_context,
-            purpose="character_selfie",
+            purpose="character_attachment",
             source_moment=text_message.body,
             intent=visual_prompt,
             scene_context=scene_context,
@@ -2292,25 +2302,24 @@ class MediaService:
         metadata: dict[str, object] | None = None,
         job_type: str = "image_generation",
         request_task: str | None = None,
-        character_visual_directions: str = "",
         current_user_id: str | None = None,
         prompt_brief: ImagePromptBrief | None = None,
     ) -> MediaAssetRecord:
+        source_messages = self.repositories.list_messages(save_id)
         source_message = _source_message(
-            messages=self.repositories.list_messages(save_id),
+            messages=source_messages,
             source_message_id=source_message_id,
         )
         if source_message is not None:
             _raise_if_safety_transition_source(source_message)
         if prompt_brief is None:
-            characters = await self._ensure_current_clothing(
-                save_id=save_id,
-                characters=image_scene_characters(
-                    self.repositories, save_id=save_id,
-                    source_message_id=source_message_id,
-                ),
-                image_context=scene_context,
+            characters = image_scene_characters(
+                self.repositories, save_id=save_id, source_message_id=source_message_id,
             )
+            if source_messages and source_messages[-1].id == source_message_id:
+                characters = await self._ensure_current_clothing(
+                    save_id=save_id, characters=characters, image_context=scene_context,
+                )
             prompt_brief = self._scene_prompt_brief(
                 save_id=save_id, source_message_id=source_message_id,
                 scene_context=scene_context, characters=characters,
@@ -3225,7 +3234,6 @@ class MediaService:
         source_media_paths: tuple[Path, ...] = ()
         metadata: dict[str, object] | None = None
         request_task: str | None = None
-        character_visual_directions = ""
         if media_type == "video":
             preference = roleplay_model_preference(
                 repositories=self.repositories,
@@ -3254,7 +3262,6 @@ class MediaService:
             source_media_paths = request_context.source_media_paths
             metadata = request_context.metadata
             request_task = request_context.request_task
-            character_visual_directions = request_context.character_visual_directions
         scene_context, context_breakdown = self._build_scene_context_with_breakdown(
             save_id=save_id,
             source_message_id=source_message[0].id,
@@ -3286,9 +3293,6 @@ class MediaService:
             source_media_paths=source_media_paths,
             metadata=metadata,
             request_task=request_task if media_type != "video" else None,
-            character_visual_directions=(
-                character_visual_directions if media_type != "video" else ""
-            ),
         )
 
     async def generate_prepared_automatic(
@@ -3355,7 +3359,6 @@ class MediaService:
             source_media_paths=prepared.source_media_paths,
             metadata=prepared.metadata,
             request_task=prepared.request_task,
-            character_visual_directions=prepared.character_visual_directions,
             prompt_brief=prepared.image_prompt_brief or ImagePromptBrief(
                 scene_context=prepared.scene_context,
                 intent=prepared.character_visual_directions,

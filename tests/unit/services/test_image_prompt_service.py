@@ -63,7 +63,7 @@ def _service(
 
 def test_brief_round_trips_textual_snapshot_without_live_registry() -> None:
     brief = ImagePromptBrief(
-        purpose="character_selfie",
+        purpose="character_attachment",
         source_moment="Mira holds a phone at arm's length beside the copper door.",
         scene_context="Soft rain glistens on the stone steps.",
         subjects=(
@@ -162,7 +162,7 @@ def test_draft_preserves_full_profiles_and_distinct_actions_in_plain_prose(
         ("scene", "complete scene"),
         ("character_reference", "simple background"),
         ("solo_character", "exactly one subject"),
-        ("character_selfie", "arm's-length"),
+        ("character_attachment", "arm's-length"),
         ("object_attachment", "requested object"),
     ],
 )
@@ -436,3 +436,30 @@ def test_fit_rejects_missing_authoritative_suffix_without_rewriting(
         ))
 
     assert not provider.requests
+
+
+def test_character_attachment_framing_follows_intent_instead_of_forcing_selfie(
+    repositories: PersistenceRepositories,
+) -> None:
+    provider = ProseProvider("Mira holds a large brass clock with both hands.")
+    service = _service(repositories, provider)
+    brief = ImagePromptBrief(
+        purpose="character_attachment",
+        intent="A full-length mirror outfit picture; both hands hold the clock.",
+        subjects=(ImagePromptSubject(
+            character_id="mira", name="Mira",
+            current_action="holding a large brass clock with both hands",
+        ),),
+        style_preset="none",
+    )
+
+    prompt = asyncio.run(service.draft(
+        save_id="save", source_message_id="moment", brief=brief,
+    ))
+
+    context = rendered_chat_request_text(provider.requests[0])
+    assert brief.intent in context
+    assert "both hands" in context
+    assert "When it asks for a selfie" in context
+    assert "need not be a selfie" in context
+    assert prompt == "Mira holds a large brass clock with both hands."

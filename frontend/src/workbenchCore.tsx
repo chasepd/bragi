@@ -1790,7 +1790,7 @@ const MODEL_ROUTING_GROUPS: readonly ModelRoutingLaneGroupMeta[] = [
       {
         id: "image_prompt",
         label: "Image Prompt",
-        title: "Scene image prompt model.",
+        title: "Image prompt model.",
         capabilities: ["chat"],
         targetPurposes: ["image_prompt"],
         icon: MessageSquareText
@@ -1986,7 +1986,7 @@ const TASK_MODEL_TOOLTIPS: Record<string, string> = {
   npc_knowledge_audit: "Sets the structured-output model Bragi uses to audit NPC knowledge boundaries after narrator verification.",
   content_safety: "Sets the structured-output safety agent Bragi uses to enforce the selected content-rating ceiling.",
   summarization: "Sets the model Bragi uses to summarize older chronicle context.",
-  image_prompt: "Sets the model Bragi uses to turn scene context into image prompts.",
+  image_prompt: "Sets the model Bragi uses to turn scene and character details into prompts for generated images.",
   image_generation: "Sets the model Bragi uses to generate scene images.",
   image_to_image_generation: "Sets the default image-edit model Bragi uses when a flow-specific image edit override is not set.",
   scene_image_edit_generation: "Sets the image-edit model Bragi uses when scene images are generated from character reference images.",

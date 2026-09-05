@@ -393,6 +393,19 @@ class SequenceImageProvider(RecordingImageProvider):
         return outcome
 
 
+class SequencePromptProvider(RecordingImageProvider):
+    def __init__(self, prompts: list[str]) -> None:
+        super().__init__(_VALID_PNG_BYTES)
+        self.prompts = prompts
+
+    async def chat(self, request: ChatRequest) -> ChatResponse:
+        self.chat_requests.append(request)
+        return ChatResponse(
+            body=self.prompts.pop(0), provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
 class RecordingVideoProvider(RecordingImageProvider):
     def __init__(
         self,
@@ -3910,9 +3923,11 @@ def test_automatic_generation_uses_deferred_source_message_ordinal(
     ]
 
 
+@pytest.mark.parametrize("legacy_payload", [False, True])
 def test_generate_prepared_automatic_uses_context_captured_during_prepare(
     repositories: PersistenceRepositories,
     tmp_path: Path,
+    legacy_payload: bool,
 ) -> None:
     save, messages = _save_with_image_preference(repositories)
     provider = RecordingImageProvider()
@@ -3931,6 +3946,10 @@ def test_generate_prepared_automatic_uses_context_captured_during_prepare(
     assert prepared is not None
     assert prepared.source_message_id == messages[-1].id
     assert "POST_PREPARE_SCENE_MUTATION" not in prepared.scene_context
+    payload = prepared.to_json()
+    if legacy_payload:
+        payload.pop("image_prompt_brief")
+    prepared = type(prepared).from_json(payload)
 
     repositories.upsert_scene_snapshot(
         save_id=save.id,
@@ -10006,3 +10025,163 @@ def _assert_private_modes(path: Path) -> None:
         return
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_image_fallback_compresses_and_persists_exact_submitted_prompt(
+    repositories: PersistenceRepositories, tmp_path: Path,
+) -> None:
+    save, messages = _save_with_image_preference(repositories)
+    repositories.set_model_preference(
+        task="image_generation", provider="primary", model_id="primary/image",
+    )
+    _configure_image_fallback(repositories, enabled=True)
+    repositories.set_app_setting(
+        "image_prompt_model_limits", {"fallback": {"fallback/image": 280}},
+    )
+    draft_provider = SequencePromptProvider([
+        "Mara holds a lantern on the bridge. " + "Ash falls over the stone. " * 80,
+        "Mara holds a lantern on the ash-covered bridge.",
+    ])
+    primary = SequenceImageProvider(provider_name="primary", outcomes=[
+        ProviderError(
+            ProviderErrorCategory.PROVIDER_ERROR, "image service unavailable",
+        ),
+    ])
+    fallback = SequenceImageProvider(provider_name="fallback", outcomes=[
+        ImageResponse(
+            provider="fallback", model_id="fallback/image",
+            image_bytes=_VALID_PNG_BYTES,
+        ),
+    ])
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": draft_provider, "primary": primary, "fallback": fallback},
+        media_dir=tmp_path / "media",
+    )
+
+    asset = asyncio.run(service.generate_for_message(
+        save_id=save.id, source_message_id=messages[-1].id,
+    ))
+
+    assert len(draft_provider.chat_requests) == 2
+    assert len(primary.image_requests[0].prompt) > 280
+    submitted = fallback.image_requests[0].prompt
+    assert len(submitted) <= 280
+    assert submitted.startswith("Mara holds a lantern on the ash-covered bridge.")
+    assert "Style preset: Realistic" in submitted
+    assert "truncated" not in submitted
+    assert asset.prompt == submitted
+    diagnostics = json.loads(asset.metadata_json)["image_prompt"]
+    assert diagnostics["fallback_compressed"] is True
+
+
+def test_scene_fallback_updates_reference_mapping_without_changing_subjects(
+    repositories: PersistenceRepositories, tmp_path: Path,
+) -> None:
+    save, messages = _save_with_image_preference(repositories)
+    first = repositories.add_character(
+        save_id=save.id, character_id="actor-a", name="Mara", appearance="Copper curls",
+        current_clothing="green coat", source_message_id=messages[-1].id,
+    )
+    second = repositories.add_character(
+        save_id=save.id, character_id="actor-b", name="Oren",
+        appearance="Silver scales",
+        current_clothing="blue coveralls", source_message_id=messages[-1].id,
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id, present_character_ids=[first.id, second.id],
+        source_message_id=messages[-1].id,
+    )
+    media_dir = tmp_path / "media"
+    first_reference = _persist_character_reference(
+        repositories, media_dir=media_dir, save_id=save.id,
+        source_message_id=messages[-1].id, character_id=first.id, filename="mara.png",
+    )
+    second_reference = _persist_character_reference(
+        repositories, media_dir=media_dir, save_id=save.id,
+        source_message_id=messages[-1].id, character_id=second.id, filename="oren.png",
+    )
+    repositories.set_model_preference(
+        task="image_to_image_generation", provider="primary", model_id="primary/edit",
+    )
+    _configure_image_edit_fallback(repositories, enabled=True)
+    primary = SequenceImageProvider(provider_name="primary", outcomes=[
+        ProviderError(
+            ProviderErrorCategory.PROVIDER_ERROR, "image service unavailable",
+        ),
+    ])
+    primary._image_reference_limit = 2
+    fallback = SequenceImageProvider(provider_name="fallback-edit", outcomes=[
+        ImageResponse(
+            provider="fallback-edit", model_id="fallback/edit",
+            image_bytes=_VALID_PNG_BYTES,
+        ),
+    ])
+    drafter = RecordingImageProvider(drafted_prompt=(
+        "Mara with copper curls kneels left of Oren with silver scales. "
+        "Oren lifts a blue key while Mara braces the chest."
+    ))
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": drafter, "primary": primary, "fallback-edit": fallback},
+        media_dir=media_dir,
+    )
+
+    asset = asyncio.run(service.generate_for_message(
+        save_id=save.id, source_message_id=messages[-1].id,
+    ))
+
+    assert primary.image_requests[0].source_media_asset_ids == (
+        first_reference.id, second_reference.id,
+    )
+    assert "Attached image 2 anchors Oren" in primary.image_requests[0].prompt
+    request = fallback.image_requests[0]
+    assert request.source_media_asset_ids == (first_reference.id,)
+    assert "Attached image 2" not in request.prompt
+    assert "Oren with silver scales" in request.prompt
+    assert "Oren: blue coveralls" in request.prompt
+    assert asset.prompt == request.prompt
+    metadata = json.loads(asset.metadata_json)
+    assert metadata["source_character_reference_character_ids"] == [first.id]
+    assert metadata["source_character_reference_asset_ids"] == [first_reference.id]
+
+
+def test_historical_solo_image_omits_later_character_profile_changes(
+    repositories: PersistenceRepositories, tmp_path: Path,
+) -> None:
+    save, opening, character_id = _full_roleplay_save(repositories)
+    _mark_character_present(
+        repositories, save_id=save.id, message_id=opening.id, character_id=character_id,
+    )
+    later = repositories.append_message(
+        save_id=save.id, role="narrator", body="The next day dawns.",
+    )
+    character = repositories.get_character(character_id)
+    assert character is not None
+    repositories.update_character(replace(
+        character, appearance="LATER golden hair",
+        current_clothing="LATER scarlet armor",
+        last_updated_message_id=later.id,
+    ))
+    media_dir = tmp_path / "media"
+    _persist_character_reference(
+        repositories, media_dir=media_dir, save_id=save.id,
+        source_message_id=opening.id, character_id=character_id,
+    )
+    repositories.set_model_preference(
+        task="image_to_image_generation", provider="fake", model_id="fake-edit",
+    )
+    provider = RecordingImageProvider(_VALID_PNG_BYTES)
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider}, media_dir=media_dir,
+    )
+
+    asset = asyncio.run(service.generate_character_image_for_message(
+        save_id=save.id, source_message_id=opening.id, character_id=character_id,
+    ))
+
+    assert "LATER" not in _chat_request_context(provider.chat_requests[0])
+    assert "LATER" not in asset.prompt
+    assert "The oracle studies your reflection" in _chat_request_context(
+        provider.chat_requests[0]
+    )
