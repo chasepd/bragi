@@ -239,7 +239,7 @@ export function CharactersPanel({
       {charactersStale ? <InlineNotice polite>Refreshing characters for active save...</InlineNotice> : null}
       <div className="stack-list roomy">
         {rows.map((character, index) => (
-          <details className="entity-detail" key={String(character.__draft_id ?? character.character_id ?? character.id ?? index)}>
+          <details className="entity-detail" key={`${activeSaveId}:${String(character.__draft_id ?? character.character_id ?? character.id ?? index)}`}>
             <summary>
               <span className="entity-summary-title">
                 <strong>{character.name ?? "Unnamed"}</strong>
@@ -750,15 +750,24 @@ function CharacterPicturesSection({
   activeSaveId,
   disabled,
   generationDisabled,
-  runJob
+  runJob,
+  uploading,
+  uploadError,
+  onUpload,
+  onMediaChanged
 }: {
   row: Record<string, unknown>;
   activeSaveId: string | null;
   disabled: boolean;
   generationDisabled: boolean;
   runJob: RunJob;
+  uploading: boolean;
+  uploadError: string;
+  onUpload: (file: File) => Promise<void>;
+  onMediaChanged: (model: CharacterRegistryModel) => boolean;
 }) {
   const client = useQueryClient();
+  const inputRef = useRef<HTMLInputElement | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [settingReferenceId, setSettingReferenceId] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -768,11 +777,13 @@ function CharacterPicturesSection({
   const characterId = typeof row.character_id === "string" && row.character_id ? row.character_id : null;
   const reference = characterReferenceImage(row.reference_image);
   const generated = characterGeneratedImages(row.generated_images);
+  const uploadDisabled = disabled || !activeSaveId || !characterId || uploading;
   const refreshCharacters = (model?: CharacterRegistryModel) => {
+    if (model && !onMediaChanged(model)) return;
     if (model && activeSaveId) client.setQueryData(["characters", activeSaveId], model);
-    client.invalidateQueries({ queryKey: ["characters"] });
-    client.invalidateQueries({ queryKey: ["runtime"] });
-    client.invalidateQueries({ queryKey: ["world"] });
+    client.invalidateQueries({ queryKey: ["characters", activeSaveId] });
+    client.invalidateQueries({ queryKey: runtimeQueryKey(activeSaveId) });
+    client.invalidateQueries({ queryKey: ["world", activeSaveId] });
     invalidateScenePresenceQueries(client, activeSaveId);
   };
   const setAsReference = async (image: CharacterReferenceImage) => {
@@ -803,17 +814,43 @@ function CharacterPicturesSection({
     <section className="character-pictures-section">
       <div className="section-minihead">
         <strong>Pictures</strong>
-        {reference ? (
+        <div className="command-row">
           <button
             type="button"
-            className="primary-command compact"
-            disabled={generationDisabled || !activeSaveId}
-            onClick={() => setDialogOpen(true)}
+            disabled={uploadDisabled}
+            onClick={() => inputRef.current?.click()}
           >
-            <Image size={15} /> Generate image of this character
+            {uploading ? <Loader2 className="spin" size={15} aria-hidden="true" /> : <Upload size={15} aria-hidden="true" />}
+            {uploading ? "Uploading image…" : "Upload image"}
           </button>
-        ) : null}
+          {reference ? (
+            <button
+              type="button"
+              className="primary-command compact"
+              disabled={generationDisabled || !activeSaveId || uploading}
+              onClick={() => setDialogOpen(true)}
+            >
+              <Image size={15} /> Generate image of this character
+            </button>
+          ) : null}
+        </div>
       </div>
+      <input
+        ref={inputRef}
+        className="upload-input"
+        aria-label="Upload character image"
+        type="file"
+        accept="image/png,image/jpeg,image/webp"
+        disabled={uploadDisabled}
+        onChange={(event) => {
+          const file = event.target.files?.[0];
+          event.target.value = "";
+          if (file && !uploadDisabled) {
+            setError("");
+            void onUpload(file);
+          }
+        }}
+      />
       <div className="character-picture-grid">
         {generated.map((image) => {
           const title = image.prompt_preview || "Character image";
@@ -837,7 +874,7 @@ function CharacterPicturesSection({
                   className="character-picture-reference-button"
                   title="Make reference"
                   aria-label={`Make reference: ${title}`}
-                  disabled={disabled || !activeSaveId || !characterId || settingReferenceId !== null}
+                  disabled={disabled || !activeSaveId || !characterId || settingReferenceId !== null || uploading}
                   onClick={() => void setAsReference(image)}
                 >
                   {isSetting ? <Loader2 className="spin" size={14} aria-hidden="true" /> : <Check size={14} aria-hidden="true" />}
@@ -848,7 +885,8 @@ function CharacterPicturesSection({
         })}
       </div>
       {error ? <InlineNotice>{error}</InlineNotice> : null}
-      {!generated.length ? <p className="muted">No generated pictures yet.</p> : null}
+      {uploadError ? <InlineNotice>{uploadError}</InlineNotice> : null}
+      {!generated.length ? <p className="muted">No pictures yet.</p> : null}
       {dialogOpen && reference && !disabled ? (
         <CharacterRegistryImageDialog
           row={row}
@@ -1046,6 +1084,8 @@ function CharacterEditor({
   const [error, setError] = useState("");
   const [referenceError, setReferenceError] = useState("");
   const [referenceBusy, setReferenceBusy] = useState<"generate" | "upload" | "remove" | null>(null);
+  const [galleryUploading, setGalleryUploading] = useState(false);
+  const [galleryUploadError, setGalleryUploadError] = useState("");
   const [notice, setNotice] = useState("");
   const [enhancingField, setEnhancingField] = useState<CharacterEnhanceField | null>(null);
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
@@ -1074,6 +1114,40 @@ function CharacterEditor({
   const saveDisabled = disabled || nameBlank || referenceBusy === "upload" || (!isDraftCharacter && !hasDraftChanges);
   const enhanceDisabled = disabled || nameBlank || referenceBusy !== null || !activeSaveId || !characterId || enhancingField !== null;
   const lockedFields = new Set(characterLockedFields(row.locked_fields));
+  const mergeCharacterMedia = (model: CharacterRegistryModel) => {
+    const updated = model.characters?.find((candidate) => candidate.character_id === characterId);
+    if (model.active_save_id !== activeSaveId || !updated) return false;
+    const mediaPatch = { generated_images: updated.generated_images, reference_image: updated.reference_image };
+    setRow((current) => ({ ...current, ...mediaPatch }));
+    setSavedRow((current) => ({ ...current, ...mediaPatch }));
+    return true;
+  };
+  const uploadGalleryImage = async (file: File) => {
+    if (disabled || !activeSaveId || !characterId || galleryUploading) return;
+    const saveId = activeSaveId;
+    setGalleryUploading(true);
+    setGalleryUploadError("");
+    const form = new FormData();
+    form.append("file", file);
+    form.append("save_id", saveId);
+    try {
+      const model = await api<CharacterRegistryModel>(
+        `/api/characters/${encodeURIComponent(characterId)}/image/upload`,
+        { method: "POST", body: form }
+      );
+      if (!mergeCharacterMedia(model)) {
+        throw new Error("Could not refresh character pictures");
+      }
+      await client.cancelQueries({ queryKey: ["characters", saveId], exact: true });
+      client.setQueryData(["characters", saveId], model);
+      client.invalidateQueries({ queryKey: runtimeQueryKey(saveId) });
+      client.invalidateQueries({ queryKey: ["media", saveId] });
+    } catch (failure) {
+      setGalleryUploadError(failure instanceof Error ? failure.message : "Could not upload character image");
+    } finally {
+      setGalleryUploading(false);
+    }
+  };
   const updateLockedField = (field: string, locked: boolean) => {
     const next = new Set(characterLockedFields(row.locked_fields));
     if (locked) {
@@ -1214,8 +1288,8 @@ function CharacterEditor({
           <CharacterReferenceField
             row={row}
             activeSaveId={activeSaveId}
-            disabled={disabled}
-            generationDisabled={mediaGenerationDisabled}
+            disabled={disabled || galleryUploading}
+            generationDisabled={mediaGenerationDisabled || galleryUploading}
             runJob={runJob}
             busy={referenceBusy}
             setBusy={setReferenceBusy}
@@ -1450,9 +1524,13 @@ function CharacterEditor({
         <CharacterPicturesSection
           row={row}
           activeSaveId={activeSaveId}
-          disabled={disabled}
+          disabled={disabled || referenceBusy !== null}
           generationDisabled={mediaGenerationDisabled}
           runJob={runJob}
+          uploading={galleryUploading}
+          uploadError={galleryUploadError}
+          onUpload={uploadGalleryImage}
+          onMediaChanged={mergeCharacterMedia}
         />
       ) : null}
       {activeTab === "locks" ? (

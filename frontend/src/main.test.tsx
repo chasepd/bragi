@@ -21607,6 +21607,232 @@ describe("frontend helpers", () => {
     expect(JSON.parse(String(removeCall?.[1].body))).toEqual({ save_id: "save-1" });
   });
 
+  it.each([false, true])("uploads gallery pictures with existing reference=%s and preserves unsaved profile edits", async (hasReference) => {
+    const picture = {
+      media_asset_id: "media-uploaded-1",
+      mime_type: "image/png",
+      prompt_preview: "Uploaded character image",
+      provider: "local",
+      model: "upload",
+      created_at: null,
+      source: "uploaded"
+    };
+    const character = {
+      ...characterRegistryPayload().characters![0],
+      appearance: "Cropped curls",
+      visual_notes: "A green coat",
+      locked_fields: ["appearance"],
+      reference_image: hasReference ? { ...picture, media_asset_id: "media-reference-1", prompt_preview: "Mara reference" } : null,
+      generated_images: []
+    };
+    const initialPayload = characterRegistryPayload({ characters: [character] });
+    const uploadedPayload = characterRegistryPayload({ characters: [{ ...character, generated_images: [picture] }] });
+    const promotedPayload = characterRegistryPayload({ characters: [{
+      ...character, reference_image: picture, generated_images: hasReference ? [character.reference_image!] : []
+    }] });
+    const promotionJob: Job = {
+      id: "job-reference-set", type: "character_reference_set", status: "queued", result: null,
+      error: null, created_at: 1, save_id: "save-1"
+    };
+    let latestPayload = initialPayload;
+    const upload = deferred<{ ok: boolean; json: () => Promise<CharacterRegistryModel> }>();
+    const fetchMock = vi.fn().mockImplementation((path: string) => path === "/api/characters/character-1/image/upload"
+      ? upload.promise
+      : Promise.resolve({ ok: true, json: async () => path.endsWith("/reference-image/set") ? promotionJob : latestPayload }));
+    vi.stubGlobal("fetch", fetchMock);
+    const runJob = vi.fn((_: Job, options?: { onSucceeded?: (result: unknown) => void }) => {
+      latestPayload = promotedPayload;
+      options?.onSucceeded?.(promotedPayload);
+      return vi.fn();
+    });
+    const { CharactersPanel } = await import("./main");
+    const queryClient = new QueryClient();
+    render(
+      <QueryClientProvider client={queryClient}>
+        <CharactersPanel activeSaveId="save-1" runJob={runJob} />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(await screen.findByText("Mara"));
+    fireEvent.change(screen.getByLabelText("Appearance"), { target: { value: "A silver braid" } });
+    fireEvent.change(screen.getByLabelText("Visual notes"), { target: { value: "A blue scarf" } });
+    await userEvent.click(screen.getByRole("tab", { name: "Locks" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "Lock Role" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Pictures" }));
+    expect(screen.getByText("No pictures yet.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Upload image" })).toBeEnabled();
+    const input = screen.getByLabelText("Upload character image");
+    expect(input).toHaveAttribute("accept", "image/png,image/jpeg,image/webp");
+    const file = new File([new Uint8Array([137, 80, 78, 71])], "mara.png", { type: "image/png" });
+    await userEvent.upload(input, file);
+    expect(screen.getByRole("button", { name: "Uploading image…" })).toBeDisabled();
+    expect(input).toBeDisabled();
+    const uploadCall = fetchMock.mock.calls.find(([path]) => path === "/api/characters/character-1/image/upload");
+    expect(uploadCall?.[1].method).toBe("POST");
+    expect(formDataTextEntries(uploadCall?.[1].body)).toEqual({ file: "mara.png", save_id: "save-1" });
+    expect((uploadCall?.[1].body as FormData).get("file")).toBe(file);
+
+    await userEvent.click(screen.getByRole("tab", { name: "Profile" }));
+    fireEvent.change(screen.getByLabelText("Role"), { target: { value: "Harbor scout" } });
+    await userEvent.click(screen.getByRole("tab", { name: "Pictures" }));
+    expect(screen.getByRole("button", { name: "Uploading image…" })).toBeDisabled();
+    latestPayload = uploadedPayload;
+    await act(async () => upload.resolve({ ok: true, json: async () => uploadedPayload }));
+    expect(await screen.findByAltText("Uploaded character image")).toHaveAttribute(
+      "src", "/api/media/media-uploaded-1/thumbnail?save_id=save-1"
+    );
+    expect(screen.getByRole("button", { name: "Make reference: Uploaded character image" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Upload image" })).toBeEnabled();
+    expect(runJob).not.toHaveBeenCalled();
+    expect(queryClient.getQueryData(["characters", "save-1"])).toEqual(uploadedPayload);
+    await userEvent.click(screen.getByRole("tab", { name: "Profile" }));
+    expect(screen.getByLabelText("Role")).toHaveValue("Harbor scout");
+    expect(screen.getByLabelText("Appearance")).toHaveValue("A silver braid");
+    expect(screen.getByLabelText("Visual notes")).toHaveValue("A blue scarf");
+    expect(Boolean(screen.queryByAltText("Mara reference"))).toBe(hasReference);
+    expect(screen.getByRole("button", { name: "Save character" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("tab", { name: "Locks" }));
+    expect(screen.getByRole("checkbox", { name: "Lock Appearance" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Lock Role" })).toBeChecked();
+
+    await userEvent.click(screen.getByRole("tab", { name: "Pictures" }));
+    await userEvent.click(screen.getByRole("button", { name: "Make reference: Uploaded character image" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Make reference: Uploaded character image" })).not.toBeInTheDocument());
+    const promotionCall = fetchMock.mock.calls.find(([path]) => path.endsWith("/reference-image/set"));
+    expect(JSON.parse(String(promotionCall?.[1].body))).toEqual({ save_id: "save-1", media_asset_id: "media-uploaded-1" });
+    await userEvent.click(screen.getByRole("tab", { name: "Profile" }));
+    expect(screen.getByAltText("Uploaded character image")).toBeInTheDocument();
+    expect(screen.getByLabelText("Role")).toHaveValue("Harbor scout");
+    expect(screen.getByLabelText("Appearance")).toHaveValue("A silver braid");
+    expect(screen.getByLabelText("Visual notes")).toHaveValue("A blue scarf");
+    await userEvent.click(screen.getByRole("tab", { name: "Locks" }));
+    expect(screen.getByRole("checkbox", { name: "Lock Appearance" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Lock Role" })).toBeChecked();
+
+    await userEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    await userEvent.click(screen.getByRole("button", { name: "Discard" }));
+    expect(screen.getByRole("checkbox", { name: "Lock Role" })).not.toBeChecked();
+    await userEvent.click(screen.getByRole("tab", { name: "Profile" }));
+    expect(screen.getByLabelText("Appearance")).toHaveValue("Cropped curls");
+    expect(screen.getByLabelText("Visual notes")).toHaveValue("A green coat");
+    expect(screen.getByRole("button", { name: "Save character" })).toBeDisabled();
+    expect(screen.getByAltText("Uploaded character image")).toBeInTheDocument();
+  });
+
+  it("shows gallery upload errors and retries the same file", async () => {
+    const initialPayload = characterRegistryPayload();
+    const picture = {
+      media_asset_id: "media-uploaded-1", mime_type: "image/webp", prompt_preview: "Uploaded character image",
+      provider: "local", model: "upload", created_at: null, source: "uploaded"
+    };
+    const uploadedPayload = characterRegistryPayload({
+      characters: [{ ...initialPayload.characters![0], generated_images: [picture] }]
+    });
+    let attempts = 0;
+    let latestPayload = initialPayload;
+    const fetchMock = vi.fn().mockImplementation(async (path: string) => {
+      if (path === "/api/characters/character-1/image/upload") {
+        attempts += 1;
+        if (attempts === 1) return { ok: false, status: 400, json: async () => ({ detail: "Could not read this image" }) };
+        latestPayload = uploadedPayload;
+      }
+      return { ok: true, json: async () => latestPayload };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { CharactersPanel } = await import("./main");
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CharactersPanel activeSaveId="save-1" runJob={vi.fn(() => vi.fn())} />
+      </QueryClientProvider>
+    );
+    await userEvent.click(await screen.findByText("Mara"));
+    await userEvent.click(screen.getByRole("tab", { name: "Pictures" }));
+    const file = new File(["image"], "mara.webp", { type: "image/webp" });
+    await userEvent.upload(screen.getByLabelText("Upload character image"), file);
+    expect(await screen.findByText("Could not read this image")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Upload image" })).toBeEnabled();
+    expect(screen.getByLabelText("Upload character image")).toHaveValue("");
+    await userEvent.upload(screen.getByLabelText("Upload character image"), file);
+    expect(await screen.findByAltText("Uploaded character image")).toBeInTheDocument();
+    expect(screen.queryByText("Could not read this image")).not.toBeInTheDocument();
+    expect(attempts).toBe(2);
+    expect(screen.queryByText("Unsaved changes")).not.toBeInTheDocument();
+  });
+
+  it("disables gallery uploads for children and unsaved characters", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => characterRegistryPayload() }));
+    const { CharactersPanel } = await import("./main");
+    const queryClient = new QueryClient();
+    const view = render(
+      <QueryClientProvider client={queryClient}>
+        <CharactersPanel activeSaveId="save-1" runJob={vi.fn(() => vi.fn())}
+          currentUser={{ id: "child-1", username: "Ilyra", role: "child", status: "active" }} />
+      </QueryClientProvider>
+    );
+    await userEvent.click(await screen.findByText("Mara"));
+    await userEvent.click(screen.getByRole("tab", { name: "Pictures" }));
+    expect(screen.getByRole("button", { name: "Upload image" })).toBeDisabled();
+    expect(screen.getByLabelText("Upload character image")).toBeDisabled();
+    view.rerender(
+      <QueryClientProvider client={queryClient}>
+        <CharactersPanel activeSaveId="save-1" runJob={vi.fn(() => vi.fn())} />
+      </QueryClientProvider>
+    );
+    expect(screen.getByRole("button", { name: "Upload image" })).toBeEnabled();
+    await userEvent.click(screen.getByText("Mara"));
+    await userEvent.click(screen.getByTitle("Add character"));
+    const draftTitle = screen.getByText("New character");
+    await userEvent.click(draftTitle);
+    const draft = within(draftTitle.closest("details")!);
+    await userEvent.click(draft.getByRole("tab", { name: "Pictures" }));
+    expect(draft.getByRole("button", { name: "Upload image" })).toBeDisabled();
+    expect(draft.getByLabelText("Upload character image")).toBeDisabled();
+  });
+
+  it("keeps a completed gallery upload scoped to its original save after switching saves", async () => {
+    const firstPayload = characterRegistryPayload();
+    const secondPayload = characterRegistryPayload({
+      active_save_id: "save-2",
+      characters: [{ ...firstPayload.characters![0], name: "Ilyra", role: "Navigator" }]
+    });
+    const uploadedPayload = characterRegistryPayload({ characters: [{
+      ...firstPayload.characters![0],
+      generated_images: [{ media_asset_id: "media-uploaded-1", mime_type: "image/png", prompt_preview: "Uploaded character image",
+        provider: "local", model: "upload", created_at: null, source: "uploaded" }]
+    }] });
+    const upload = deferred<{ ok: boolean; json: () => Promise<CharacterRegistryModel> }>();
+    const fetchMock = vi.fn().mockImplementation((path: string) => path === "/api/characters/character-1/image/upload"
+      ? upload.promise
+      : Promise.resolve({ ok: true, json: async () => path.includes("save-2") ? secondPayload : firstPayload }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { CharactersPanel } = await import("./main");
+    const queryClient = new QueryClient();
+    const view = render(
+      <QueryClientProvider client={queryClient}>
+        <CharactersPanel activeSaveId="save-1" runJob={vi.fn(() => vi.fn())} />
+      </QueryClientProvider>
+    );
+    await userEvent.click(await screen.findByText("Mara"));
+    await userEvent.click(screen.getByRole("tab", { name: "Pictures" }));
+    await userEvent.upload(screen.getByLabelText("Upload character image"), new File(["image"], "mara.png", { type: "image/png" }));
+    view.rerender(
+      <QueryClientProvider client={queryClient}>
+        <CharactersPanel activeSaveId="save-2" runJob={vi.fn(() => vi.fn())} />
+      </QueryClientProvider>
+    );
+    await userEvent.click(await screen.findByText("Ilyra"));
+    fireEvent.change(screen.getByLabelText("Role"), { target: { value: "Captain" } });
+    await act(async () => upload.resolve({ ok: true, json: async () => uploadedPayload }));
+    expect(queryClient.getQueryData(["characters", "save-1"])).toEqual(uploadedPayload);
+    expect(queryClient.getQueryData(["characters", "save-2"])).toEqual(secondPayload);
+    expect(screen.getByLabelText("Name")).toHaveValue("Ilyra");
+    expect(screen.getByLabelText("Role")).toHaveValue("Captain");
+    await userEvent.click(screen.getByRole("tab", { name: "Pictures" }));
+    expect(screen.queryByAltText("Uploaded character image")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Upload image" })).toBeEnabled();
+    expect(fetchMock.mock.calls.filter(([path]) => String(path).includes("save-2"))).toHaveLength(1);
+  });
+
   it("generates registry character pictures from the pictures tab", async () => {
     const characterPayload: CharacterRegistryModel = {
       active_save_id: "save-1",
