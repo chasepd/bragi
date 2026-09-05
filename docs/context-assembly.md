@@ -227,8 +227,10 @@ and a smaller configured fallback. Verify that the final submitted prompt stays
 within the actual model's limit, authoritative instructions remain intact after
 the single permitted compression retry, and the saved prompt equals the
 successful request. Oversized manual prompts and failed compression should
-produce an explicit length error. Save export/import must preserve prepared
-briefs and the resulting prompt details. Never check in generated images,
+produce an explicit length error. Prepared briefs must retain serialization
+compatibility for queued workers; these transient inputs are not exported.
+Save export/import must preserve the submitted prompts, prompt metadata, and
+reference mappings. Never check in generated images,
 provider keys, save databases, or live request logs.
 
 ## Dating Route Pacing
