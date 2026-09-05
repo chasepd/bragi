@@ -29,6 +29,7 @@ import {
   LogOut,
   MessageSquare,
   MessageSquareText,
+  Music2,
   PanelRight,
   Play,
   Plus,
@@ -6983,6 +6984,14 @@ const MarkdownView = React.memo(function MarkdownView({
     <div className={className}>
       {blocks.map((block, index) => {
         const kind = block.block_type ?? block.kind;
+        if (kind === "code_block" && block.language === "lyrics") {
+          return (
+            <figure key={index} className="lyrics-block" aria-label="Sung lyrics">
+              <figcaption><Music2 size={14} aria-hidden="true" /> Lyrics</figcaption>
+              <div className="lyrics-text">{block.text ?? ""}</div>
+            </figure>
+          );
+        }
         if (kind === "code_block") return <pre key={index}><code>{block.text ?? ""}</code></pre>;
         if (kind === "blockquote") return <blockquote key={index}>{renderSpans(block.spans, block.text)}</blockquote>;
         if (kind === "bullet_item") return <p key={index}>- {renderSpans(block.spans, block.text)}</p>;
@@ -7295,7 +7304,7 @@ function pendingPlayerChronicleMessage(
   };
 }
 
-type ComposerFormatActionId = "narration" | "dialogue" | "text_message" | "clear";
+type ComposerFormatActionId = "narration" | "dialogue" | "text_message" | "lyrics" | "clear";
 type ComposerFormatResult = {
   body: string;
   selectionStart: number;
@@ -7332,6 +7341,13 @@ const COMPOSER_FORMAT_ACTIONS: readonly ComposerFormatAction[] = [
     icon: MessageSquareText
   },
   {
+    actionId: "lyrics",
+    label: "Format as lyrics",
+    title: "Lyrics (Alt+L)",
+    shortcut: "Alt+L",
+    icon: Music2
+  },
+  {
     actionId: "clear",
     label: "Clear roleplay formatting",
     title: "Clear roleplay formatting (Alt+0)",
@@ -7351,6 +7367,24 @@ function formatComposerBody(
   if (actionId === "narration") return formatComposerWrappedSelection(body, start, end, "*", "*");
   if (actionId === "dialogue") return formatComposerWrappedSelection(body, start, end, "\"", "\"");
   if (actionId === "text_message") return formatComposerLineSelection(body, start, end, formatComposerTextMessageLines);
+  if (actionId === "lyrics" || actionId === "clear") {
+    for (const match of body.matchAll(/^```lyrics[ \t]*\n([\s\S]*?)\n```[ \t]*(?=\n|$)/gm)) {
+      const blockStart = match.index;
+      const blockEnd = blockStart + match[0].length;
+      if (start >= blockStart && end <= blockEnd) {
+        return replaceComposerRange(body, blockStart, blockEnd, match[1], blockStart, blockStart + match[1].length);
+      }
+    }
+  }
+  if (actionId === "lyrics") {
+    const range = selectedComposerLineRange(body, start, end);
+    const selected = body.slice(range.start, range.end);
+    const prefix = "```lyrics\n";
+    return replaceComposerRange(
+      body, range.start, range.end, `${prefix}${selected}\n\`\`\``,
+      range.start + prefix.length, range.start + prefix.length + selected.length
+    );
+  }
   return formatComposerTextSelection(body, start, end, clearComposerRoleplayFormatting);
 }
 
@@ -7500,11 +7534,23 @@ function formatComposerTextMessageLines(text: string) {
 }
 
 function clearComposerRoleplayFormatting(text: string) {
+  let inFence = false;
+  let lyricsFence = false;
   return text
     .split("\n")
-    .map((line) => {
+    .flatMap((line) => {
+      if (line.trimStart().startsWith("```")) {
+        if (!inFence) {
+          inFence = true;
+          lyricsFence = line.trim() === "```lyrics";
+          return lyricsFence ? [] : [line];
+        }
+        inFence = false;
+        return lyricsFence ? [] : [line];
+      }
+      if (inFence) return [line];
       const unquoted = line.replace(/^(\s*)>\s?/, "$1");
-      return stripComposerLineWrapper(stripComposerLineWrapper(unquoted, "*", "*"), "\"", "\"");
+      return [stripComposerLineWrapper(stripComposerLineWrapper(unquoted, "*", "*"), "\"", "\"")];
     })
     .join("\n");
 }
@@ -7525,6 +7571,7 @@ function composerFormatActionForKey(event: React.KeyboardEvent<HTMLTextAreaEleme
   if (key === "n") return "narration";
   if (key === "q") return "dialogue";
   if (key === "m") return "text_message";
+  if (key === "l") return "lyrics";
   if (key === "0") return "clear";
   return null;
 }

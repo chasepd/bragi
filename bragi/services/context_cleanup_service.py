@@ -36,6 +36,7 @@ from bragi.providers.contracts import (
     ToolDefinition,
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.providers.system_prompt import LYRICS_INTERPRETATION_SECTION
 from bragi.redaction import redact_text
 from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
 from bragi.services.active_thread_lifecycle import active_thread_is_prompt_visible
@@ -1773,7 +1774,7 @@ def _scan_messages(
     return (
         ChatMessage(
             role="system",
-            body=(
+            body=LYRICS_INTERPRETATION_SECTION + "\n\n" + (
                 "Scan this Bragi transcript chunk for context records that may be "
                 "obsolete, contradicted, duplicate, stale, or safely over-specific. "
                 "Return concise notes only through the enforced schema. Do not "

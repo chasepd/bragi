@@ -23,12 +23,23 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolCallResponse,
 )
-from bragi.services.context_cleanup_service import ContextCleanupService
+from bragi.services.context_cleanup_service import (
+    ContextCleanupService,
+    _scan_messages,
+    _scan_tool_messages,
+)
 from bragi.services.world_data_service import (
     WorldDataEdits,
     WorldDataScenarioEdit,
     WorldDataService,
 )
+
+
+def test_cleanup_scan_preserves_lyrics_interpretation() -> None:
+    for builder in (_scan_messages, _scan_tool_messages):
+        messages = builder(save_id="save-1", chunk_index=0, messages=())
+        assert "Lyrics convention:" in messages[0].body
+        assert "not evidence of literal events" in messages[0].body
 
 
 @pytest.fixture

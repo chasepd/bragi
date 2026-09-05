@@ -287,6 +287,26 @@ def test_chronicle_model_preserves_raw_body_while_exposing_markdown_blocks(
     )
 
 
+def test_chronicle_lyrics_preserve_literal_lines_stanzas_and_raw_body(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    chronicle = _import_chronicle_without_gtk(monkeypatch)
+    lyrics = "*Stay*\n> beside me\n\n1. More dawn"
+    body = "*I sing.*\n\n```lyrics\n" + lyrics + "\n```\n\n*I pause.*"
+
+    model = chronicle.build_chronicle_model(
+        messages=(_message(role="player", speaker_name="Mara", body=body),),
+    )
+
+    [message] = list(_value(model, "messages", "items"))
+    assert _value(message, "body", "text") == body
+    [_, verse, _] = _render_blocks(message)
+    assert _block_kind(verse) == "code_block"
+    assert _value(verse, "language") == "lyrics"
+    assert _value(verse, "text") == lyrics
+    assert _value(verse, "spans") == ()
+
+
 def test_chronicle_markdown_blocks_cover_lists_quotes_and_fenced_code(
     monkeypatch: MonkeyPatch,
 ) -> None:

@@ -5319,6 +5319,27 @@ def test_update_after_turn_clears_scene_current_lists_when_empty(
     assert "red-hot glass" not in scene_text
 
 
+def test_context_update_and_enrichment_preserve_lyrics_interpretation() -> None:
+    module = _context_update_module()
+    update = module.ContextUpdateRequest(
+        save_id="save-1", messages=(), scene_snapshot=None,
+        locations=(), characters=(), active_threads=(), entity_links=(),
+    )
+    enrichment = module.WorldDataEnrichmentRequest(
+        save_id="save-1", messages=(), scenario_context="", scene_snapshot=None,
+        locations=(), active_threads=(),
+    )
+
+    for messages in (
+        module._context_update_messages(update),
+        module._context_update_tool_messages(update),
+        module._world_data_enrichment_messages(enrichment),
+        module._world_data_enrichment_tool_messages(enrichment),
+    ):
+        assert "Lyrics convention:" in messages[0].body
+        assert "not evidence of literal events" in messages[0].body
+
+
 def test_context_update_prompt_guides_conservative_scene_time_extraction() -> None:
     module = _context_update_module()
     request = module.ContextUpdateRequest(

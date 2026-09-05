@@ -2656,6 +2656,25 @@ def test_planner_prompt_instructs_batched_intents_and_knowledge_candidates() -> 
     assert "short concrete register" in system_body
 
 
+def test_agentic_prompts_keep_lyrics_distinct_from_canonical_events() -> None:
+    request = ChatRequest(provider="fake", model_id="narrator", messages=())
+    spec = NarratorMessageSpec(
+        intent="Hear the song.", thesis="A performance.", must_say=(), avoid=(),
+        tone="quiet", uncertainties=(), evidence_source_ids=(),
+    )
+
+    for messages in (
+        agentic_context_module._observation_messages(()),
+        agentic_context_module._curation_messages(()),
+        agentic_context_module._planner_messages(request),
+        agentic_context_module._verifier_messages(
+            spec=spec, request=request, narrator_body="The room falls quiet.",
+        ),
+    ):
+        assert "Lyrics convention:" in messages[0].body
+        assert "not evidence of literal events" in messages[0].body
+
+
 def test_planner_prompt_instructs_plain_concrete_prose() -> None:
     request = ChatRequest(
         provider="fake-chat",

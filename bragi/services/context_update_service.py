@@ -48,6 +48,7 @@ from bragi.providers.errors import (
     provider_error_is_model_not_found,
 )
 from bragi.providers.structured_schema import normalize_strict_json_schema
+from bragi.providers.system_prompt import LYRICS_INTERPRETATION_SECTION
 from bragi.redaction import redact_text
 from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
 from bragi.scene_facts import (
@@ -7887,7 +7888,7 @@ def _context_update_messages(request: ContextUpdateRequest) -> tuple[ChatMessage
     return (
         ChatMessage(
             role="system",
-            body=(
+            body=LYRICS_INTERPRETATION_SECTION + "\n\n" + (
                 "Extract structured Bragi context registry updates from the "
                 "completed turn. Use the enforced response schema. Include only "
                 "facts directly supported by the messages. Prefer additive or "
@@ -8344,7 +8345,7 @@ def _world_data_enrichment_messages(
     return (
         ChatMessage(
             role="system",
-            body=(
+            body=LYRICS_INTERPRETATION_SECTION + "\n\n" + (
                 "Enrich sparse Bragi world data after the factual extraction pass. "
                 "Use the enforced response schema. Fill only blank details for "
                 "the listed records when the completed turn directly supports "
