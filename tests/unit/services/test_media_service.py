@@ -10538,7 +10538,9 @@ def test_character_group_image_checks_every_member_before_model_calls(
         outsider = repositories.add_character(save_id=other_save.id, name="Outsider")
         selected = (characters[0].id, outsider.id)
     elif failure == "no_reference":
-        repositories.archive_media_asset_only(save_id=save.id, media_asset_id=references[1].id)
+        repositories.archive_media_asset_only(
+            save_id=save.id, media_asset_id=references[1].id,
+        )
     else:
         (media_dir / references[1].path).unlink()
     provider = RecordingImageProvider(_VALID_PNG_BYTES, image_reference_limit=1)
@@ -10573,7 +10575,9 @@ def test_character_group_image_reference_cap_retains_all_subjects(
 
     request = provider.image_requests[0]
     assert request.source_media_asset_ids == tuple(r.id for r in references[:limit])
-    assert "exactly 3 subjects together in one frame: Mara, Oren, Nira" in request.prompt
+    assert (
+        "exactly 3 subjects together in one frame: Mara, Oren, Nira" in request.prompt
+    )
     assert f"Attached image {limit + 1}" not in request.prompt
     context = _chat_request_context(provider.chat_requests[0])
     for character in characters[:3]:
@@ -10593,7 +10597,10 @@ def test_character_group_image_fallback_keeps_membership_and_actual_mapping(
     save, source, characters, references = _group_image_scene(repositories, media_dir)
     if shared_reference:
         for link in repositories.list_entity_links(save.id):
-            if link.entity_id == characters[1].id and link.relation == "reference_image":
+            if (
+                link.entity_id == characters[1].id
+                and link.relation == "reference_image"
+            ):
                 repositories.delete_entity_link(link.id)
         repositories.add_entity_link(
             save_id=save.id, entity_type="character", entity_id=characters[1].id,
@@ -10605,7 +10612,9 @@ def test_character_group_image_fallback_keeps_membership_and_actual_mapping(
     )
     _configure_image_edit_fallback(repositories, enabled=True)
     primary = SequenceImageProvider(provider_name="primary", outcomes=[
-        ProviderError(ProviderErrorCategory.PROVIDER_ERROR, "image service unavailable"),
+        ProviderError(
+            ProviderErrorCategory.PROVIDER_ERROR, "image service unavailable",
+        ),
     ])
     primary._image_reference_limit = 3
     fallback = SequenceImageProvider(provider_name="fallback-edit", outcomes=[
@@ -10628,7 +10637,9 @@ def test_character_group_image_fallback_keeps_membership_and_actual_mapping(
     request = fallback.image_requests[0]
     assert request.source_media_asset_ids == (references[0].id,)
     assert "Attached image 2" not in request.prompt
-    assert "exactly 3 subjects together in one frame: Mara, Oren, Nira" in request.prompt
+    assert (
+        "exactly 3 subjects together in one frame: Mara, Oren, Nira" in request.prompt
+    )
     assert "Oren: blue coveralls" in request.prompt
     assert "Nira: gold tunic" in request.prompt
     assert asset.prompt == request.prompt
@@ -10638,8 +10649,9 @@ def test_character_group_image_fallback_keeps_membership_and_actual_mapping(
     assert metadata["source_character_reference_asset_ids"] == [references[0].id]
 
 
+@pytest.mark.parametrize("shared_reference", [False, True])
 def test_character_group_image_regeneration_keeps_membership_and_references(
-    repositories: PersistenceRepositories, tmp_path: Path,
+    repositories: PersistenceRepositories, tmp_path: Path, shared_reference: bool,
 ) -> None:
     media_dir = tmp_path / "media"
     save, source, characters, references = _group_image_scene(repositories, media_dir)
@@ -10647,6 +10659,11 @@ def test_character_group_image_regeneration_keeps_membership_and_references(
     service = MediaService(
         repositories=repositories, providers={"fake": provider}, media_dir=media_dir,
     )
+    if shared_reference:
+        service.set_character_reference_image(
+            save_id=save.id, character_id=characters[1].id,
+            media_asset_id=references[0].id,
+        )
     original = asyncio.run(service.generate_character_image_for_message(
         save_id=save.id, source_message_id=source.id,
         character_ids=tuple(character.id for character in characters[:3]),
@@ -10663,10 +10680,16 @@ def test_character_group_image_regeneration_keeps_membership_and_references(
     assert metadata["source_character_reference_character_ids"] == [
         c.id for c in characters[:3]
     ]
-    assert provider.image_requests[-1].source_media_asset_ids == tuple(
-        reference.id for reference in references[:3]
+    expected_references = (
+        references[0].id,
+        references[0].id if shared_reference else references[1].id,
+        references[2].id,
     )
-    assert original.id not in [asset.id for asset in repositories.list_media_assets(save.id)]
+    assert provider.image_requests[-1].source_media_asset_ids == expected_references
+    assert metadata["source_character_reference_asset_ids"] == list(expected_references)
+    assert original.id not in [
+        asset.id for asset in repositories.list_media_assets(save.id)
+    ]
 
 
 @pytest.mark.parametrize("historical", [False, True])
@@ -10677,6 +10700,10 @@ def test_character_group_image_infers_clothing_only_for_latest_scene(
     save, source, characters, references = _group_image_scene(repositories, media_dir)
     for character in characters[:2]:
         repositories.update_character(replace(character, current_clothing=""))
+    repositories.save_provider_model(
+        provider="fake", model_id="fake-structured", display_name="Fake Structured",
+        capabilities=["structured_output"],
+    )
     repositories.set_model_preference(
         task="response_planning", provider="fake", model_id="fake-structured",
     )
@@ -10687,7 +10714,8 @@ def test_character_group_image_infers_clothing_only_for_latest_scene(
         for character in characters[:2]:
             repositories.update_character(replace(
                 character, appearance="LATER transformed appearance",
-                current_clothing="LATER scarlet armor", last_updated_message_id=later.id,
+                current_clothing="LATER scarlet armor",
+                last_updated_message_id=later.id,
             ))
         for reference in references[:2]:
             repositories.connection.execute(
@@ -10719,7 +10747,9 @@ def test_character_group_image_infers_clothing_only_for_latest_scene(
         assert len(provider.clothing_requests) == 1
         assert "Mara: green raincoat" in asset.prompt
         assert "Oren: blue scarf" in asset.prompt
-        for character_id, clothing in (("mara", "green raincoat"), ("oren", "blue scarf")):
+        for character_id, clothing in (
+            ("mara", "green raincoat"), ("oren", "blue scarf"),
+        ):
             updated = repositories.get_character(character_id)
             assert updated is not None and updated.current_clothing == clothing
 

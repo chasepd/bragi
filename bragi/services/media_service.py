@@ -1720,11 +1720,24 @@ class MediaService:
         *,
         save_id: str,
         source_message_id: str,
-        character_id: str,
+        character_id: str | None = None,
+        character_ids: tuple[str, ...] | None = None,
         job_context: str | None = None,
         retry_progress_callback: ProviderRetryProgressCallback | None = None,
         current_user_id: str | None = None,
     ) -> MediaAssetRecord:
+        if character_id is not None and character_ids is not None:
+            raise ValueError("Provide either character_id or character_ids, not both")
+        selected_ids = (
+            character_ids if character_ids is not None
+            else (character_id,) if character_id is not None else ()
+        )
+        if not 1 <= len(selected_ids) <= 3:
+            raise ValueError("Select between 1 and 3 characters")
+        if any(not item.strip() for item in selected_ids):
+            raise ValueError("Selected character IDs must be nonblank")
+        if len(set(selected_ids)) != len(selected_ids):
+            raise ValueError("Selected character IDs must be unique")
         if _scenario_type_for_save(
             repositories=self.repositories,
             save_id=save_id,
@@ -1738,44 +1751,48 @@ class MediaService:
             raise ValueError(f"Unknown source message id: {source_message_id}")
         _raise_if_safety_transition_source(source_message)
 
-        character = self.repositories.get_character(character_id)
-        if character is None or character.save_id != save_id:
-            raise ValueError(f"Unknown character id: {character_id}")
         present_character_ids = _present_character_ids_for_message(
             repositories=self.repositories,
             save_id=save_id,
             source_message_id=source_message_id,
         )
-        if character.id not in present_character_ids:
-            raise ValueError("Selected character is not present in this scene")
         eligible = {
             participant.id: participant
             for participant in image_scene_characters(
                 self.repositories, save_id=save_id, source_message_id=source_message_id,
             )
         }
-        # Historical presence can be known even after the profile was updated.
-        # Keep the requested identity, but do not invent its prior appearance.
-        character = eligible.get(character.id) or replace(
-            character, appearance="", visual_notes="", current_clothing="", age="",
-        )
         preference = self._character_image_preference(save_id=save_id)
-        reference = _linked_character_reference_asset(
-            repositories=self.repositories,
-            save_id=save_id,
-            character_id=character.id,
-            source_message_id=source_message_id,
-        )
-        if reference is None:
-            raise ValueError(
-                "Selected character does not have a reference image available at the "
-                "selected moment"
+        selected: list[CharacterRecord] = []
+        references: list[MediaAssetRecord] = []
+        for selected_id in selected_ids:
+            character = self.repositories.get_character(selected_id)
+            if character is None or character.save_id != save_id:
+                raise ValueError(f"Unknown character id: {selected_id}")
+            if character.id not in present_character_ids:
+                raise ValueError("Selected character is not present in this scene")
+            # Historical presence can be known even after the profile was updated.
+            # Keep the requested identity, but do not invent its prior appearance.
+            selected.append(eligible.get(character.id) or replace(
+                character, appearance="", visual_notes="", current_clothing="", age="",
+            ))
+            reference = _linked_character_reference_asset(
+                repositories=self.repositories,
+                save_id=save_id,
+                character_id=character.id,
+                source_message_id=source_message_id,
             )
-        request_context = self._character_image_request_context(
+            if reference is None:
+                raise ValueError(
+                    "Selected character does not have a reference image available at "
+                    "the selected moment"
+                )
+            references.append(reference)
+        characters = tuple(selected)
+        request_context = self._characters_image_request_context(
             preference=preference,
-            reference=reference,
-            character_id=character.id,
-            character_name=character.name,
+            references=tuple(references),
+            characters=characters,
             origin="message_scene",
         )
         scene_context, context_breakdown = self._build_scene_context_with_breakdown(
@@ -1784,19 +1801,28 @@ class MediaService:
         )
         messages = self.repositories.list_messages(save_id)
         if messages and messages[-1].id == source_message_id:
-            character = (
-                await self._ensure_current_clothing(
-                    save_id=save_id, characters=(character,),
-                    image_context=scene_context,
-                )
-            )[0]
-        brief = self._character_prompt_brief(
-            character=character,
-            request_context=request_context,
-            purpose="solo_character",
-            source_moment=source_message.body,
-            scene_context=scene_context,
-        )
+            characters = await self._ensure_current_clothing(
+                save_id=save_id, characters=characters, image_context=scene_context,
+            )
+        if len(characters) == 1:
+            brief = self._character_prompt_brief(
+                character=characters[0],
+                request_context=request_context,
+                purpose="solo_character",
+                source_moment=source_message.body,
+                scene_context=scene_context,
+            )
+        else:
+            brief = ImagePromptBrief(
+                purpose="group_characters",
+                source_moment=source_message.body,
+                scene_context=scene_context,
+                subjects=tuple(_image_prompt_subject(c) for c in characters),
+                references=_image_prompt_references(request_context.metadata),
+                style_preset=selected_image_style_preset(
+                    self.repositories, save_id=save_id,
+                ),
+            )
         return await self._generate_character_image_asset(
             save_id=save_id,
             source_message_id=source_message_id,
@@ -3505,6 +3531,59 @@ class MediaService:
             request_task=SCENE_IMAGE_EDIT_PURPOSE,
         )
 
+    def _characters_image_request_context(
+        self,
+        *,
+        preference: ModelPreferenceRecord,
+        references: tuple[MediaAssetRecord, ...],
+        characters: tuple[CharacterRecord, ...],
+        origin: str,
+    ) -> _ImageRequestContext:
+        # Validate every selected reference file before applying provider limits.
+        contexts = tuple(
+            self._character_image_request_context(
+                preference=preference, reference=reference,
+                character_id=character.id, character_name=character.name,
+                origin=origin,
+            )
+            for character, reference in zip(characters, references, strict=True)
+        )
+        if len(characters) == 1:
+            return contexts[0]
+        limit = _image_reference_limit(
+            provider=self.providers[preference.provider],
+            model_id=preference.model_id,
+        )
+        source_ids = tuple(
+            asset_id for context in contexts[:limit]
+            for asset_id in context.source_media_asset_ids
+        )
+        source_paths = tuple(
+            path for context in contexts[:limit] for path in context.source_media_paths
+        )
+        return _ImageRequestContext(
+            preference=preference,
+            source_media_asset_id=source_ids[0],
+            source_media_path=source_paths[0],
+            source_media_asset_ids=source_ids,
+            source_media_paths=source_paths,
+            metadata={
+                "kind": "character_image",
+                "character_ids": [character.id for character in characters],
+                "character_names": [character.name for character in characters],
+                "origin": origin,
+                "source_character_reference_asset_id": source_ids[0],
+                "source_character_reference_asset_ids": list(source_ids),
+                "source_character_reference_character_ids": [
+                    character.id for character in characters[:limit]
+                ],
+                "source_character_reference_character_names": [
+                    character.name for character in characters[:limit]
+                ],
+            },
+            request_task=CHARACTER_IMAGE_EDIT_PURPOSE,
+        )
+
     def _character_image_request_context(
         self,
         *,
@@ -3515,6 +3594,7 @@ class MediaService:
         origin: str,
     ) -> _ImageRequestContext:
         source_path = self.media_dir / reference.path
+        _assert_within_media_dir(media_dir=self.media_dir, output_path=source_path)
         if not source_path.is_file():
             raise ValueError("Character reference image file is unavailable")
         return _ImageRequestContext(
@@ -3646,13 +3726,15 @@ class MediaService:
         original_prompt = request.prompt
         if request.image_prompt_brief is not None:
             brief = ImagePromptBrief.from_json(request.image_prompt_brief)
-            retained_ids = set(_normalized_source_media_asset_ids(
+            retained_ids = list(_normalized_source_media_asset_ids(
                 request.source_media_asset_id, request.source_media_asset_ids,
             ))
-            retained = tuple(
-                reference for reference in brief.references
-                if reference.media_asset_id in retained_ids
-            )
+            retained_references: list[ImagePromptReference] = []
+            for reference in brief.references:
+                if reference.media_asset_id in retained_ids:
+                    retained_references.append(reference)
+                    retained_ids.remove(reference.media_asset_id)
+            retained = tuple(retained_references)
             if retained != brief.references:
                 body = request.prompt.removesuffix(
                     request.prompt_required_text,
@@ -5228,7 +5310,9 @@ def _replacement_source_media_asset_ids(
                 break
     if not candidates and asset.source_media_asset_id:
         candidates = [asset.source_media_asset_id]
-    return tuple(dict.fromkeys(item for item in candidates if item != asset.id))
+    # Reference positions in the saved prompt may intentionally reuse one asset
+    # for different selected characters; deduplication would change that mapping.
+    return tuple(item for item in candidates if item != asset.id)
 
 
 def _metadata_string_list(value: object) -> list[str]:
