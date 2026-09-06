@@ -10397,3 +10397,386 @@ def test_historical_scene_references_require_source_and_creation_cutoffs(
 
     expected_ids = (reference.id,) if reference_timing == "established" else ()
     assert provider.image_requests[0].source_media_asset_ids == expected_ids
+
+
+def _group_image_scene(
+    repositories: PersistenceRepositories, media_dir: Path,
+) -> tuple[SaveRecord, MessageRecord, tuple[CharacterRecord, ...],
+           tuple[MediaAssetRecord, ...]]:
+    save, messages = _save_with_image_preference(repositories)
+    characters = tuple(
+        repositories.add_character(
+            save_id=save.id, character_id=character_id, name=name,
+            appearance=appearance, current_clothing=clothing,
+            source_message_id=messages[0].id,
+        )
+        for character_id, name, appearance, clothing in (
+            ("mara", "Mara", "Copper curls", "green coat"),
+            ("oren", "Oren", "Silver scales", "blue coveralls"),
+            ("nira", "Nira", "Purple feathers", "gold tunic"),
+            ("guest", "Guest", "BYSTANDER appearance", "BYSTANDER uniform"),
+        )
+    )
+    repositories.replace_message_scene_presence(
+        save.id, messages[-1].id, [character.id for character in characters],
+        source="context_snapshot",
+    )
+    references = tuple(
+        _persist_character_reference(
+            repositories, media_dir=media_dir, save_id=save.id,
+            source_message_id=messages[0].id, character_id=character.id,
+            filename=f"{character.id}.png",
+        )
+        for character in characters
+    )
+    repositories.set_model_preference(
+        task="image_to_image_generation", provider="fake", model_id="fake-edit",
+    )
+    return save, messages[-1], characters, references
+
+
+@pytest.mark.parametrize("count", [1, 2, 3])
+def test_character_group_image_preserves_selected_order_and_profiles(
+    repositories: PersistenceRepositories, tmp_path: Path, count: int,
+) -> None:
+    media_dir = tmp_path / "media"
+    save, source, characters, references = _group_image_scene(repositories, media_dir)
+    selected = tuple(reversed(characters[:count]))
+    selected_references = tuple(reversed(references[:count]))
+    provider = RecordingImageProvider(_VALID_PNG_BYTES, image_reference_limit=3)
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider}, media_dir=media_dir,
+    )
+
+    asset = asyncio.run(service.generate_character_image_for_message(
+        save_id=save.id, source_message_id=source.id,
+        character_ids=tuple(character.id for character in selected),
+    ))
+
+    assert len(provider.image_requests) == 1
+    request = provider.image_requests[0]
+    assert request.source_media_asset_ids == tuple(r.id for r in selected_references)
+    assert request.source_media_paths == tuple(
+        media_dir / reference.path for reference in selected_references
+    )
+    assert request.image_prompt_brief is not None
+    brief = request.image_prompt_brief
+    assert brief["purpose"] == ("solo_character" if count == 1 else "group_characters")
+    assert [subject["character_id"] for subject in brief["subjects"]] == [
+        character.id for character in selected
+    ]
+    context = _chat_request_context(provider.chat_requests[0])
+    for index, character in enumerate(selected, start=1):
+        assert character.appearance in context
+        assert f"{character.name}: {character.current_clothing}" in request.prompt
+        assert f"Attached image {index} anchors {character.name}" in request.prompt
+    assert "BYSTANDER" not in request.prompt
+    metadata = json.loads(asset.metadata_json)
+    if count > 1:
+        assert metadata["character_ids"] == [character.id for character in selected]
+        assert metadata["character_names"] == [character.name for character in selected]
+        assert "character_id" not in metadata and "character_name" not in metadata
+        assert "no other scene participants" in request.prompt
+        assert metadata["source_character_reference_character_ids"] == [
+            character.id for character in selected
+        ]
+    else:
+        assert metadata["character_id"] == selected[0].id
+    assert metadata["source_character_reference_asset_ids"] == [
+        reference.id for reference in selected_references
+    ]
+
+
+@pytest.mark.parametrize(
+    ("selected", "legacy", "error"),
+    [
+        ((), None, "between 1 and 3"),
+        (("mara", "oren", "nira", "guest"), None, "between 1 and 3"),
+        (("mara", "mara"), None, "unique"),
+        (("mara", " "), None, "nonblank"),
+        (("mara",), "oren", "either character_id or character_ids"),
+        (None, None, "between 1 and 3"),
+        (("mara", "unknown"), None, "Unknown character id"),
+    ],
+)
+def test_character_group_image_rejects_invalid_selection_before_model_calls(
+    repositories: PersistenceRepositories, tmp_path: Path,
+    selected: tuple[str, ...] | None, legacy: str | None, error: str,
+) -> None:
+    media_dir = tmp_path / "media"
+    save, source, _characters, _references = _group_image_scene(repositories, media_dir)
+    provider = RecordingImageProvider(_VALID_PNG_BYTES)
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider}, media_dir=media_dir,
+    )
+
+    with pytest.raises(ValueError, match=error):
+        asyncio.run(service.generate_character_image_for_message(
+            save_id=save.id, source_message_id=source.id,
+            character_ids=selected, character_id=legacy,
+        ))
+
+    assert provider.chat_requests == []
+    assert provider.image_requests == []
+    assert _media_jobs(repositories, save.id, "character_image_generation") == []
+
+
+@pytest.mark.parametrize("failure", ["absent", "other_save", "no_reference", "file"])
+def test_character_group_image_checks_every_member_before_model_calls(
+    repositories: PersistenceRepositories, tmp_path: Path, failure: str,
+) -> None:
+    media_dir = tmp_path / "media"
+    save, source, characters, references = _group_image_scene(repositories, media_dir)
+    selected = (characters[0].id, characters[1].id)
+    if failure == "absent":
+        _mark_character_present(
+            repositories, save_id=save.id, message_id=source.id,
+            character_id=characters[0].id,
+        )
+    elif failure == "other_save":
+        other_save, _messages = _save_with_image_preference(repositories)
+        outsider = repositories.add_character(save_id=other_save.id, name="Outsider")
+        selected = (characters[0].id, outsider.id)
+    elif failure == "no_reference":
+        repositories.archive_media_asset_only(
+            save_id=save.id, media_asset_id=references[1].id,
+        )
+    else:
+        (media_dir / references[1].path).unlink()
+    provider = RecordingImageProvider(_VALID_PNG_BYTES, image_reference_limit=1)
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider}, media_dir=media_dir,
+    )
+
+    with pytest.raises(ValueError):
+        asyncio.run(service.generate_character_image_for_message(
+            save_id=save.id, source_message_id=source.id, character_ids=selected,
+        ))
+
+    assert provider.chat_requests == []
+    assert provider.image_requests == []
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_character_group_image_reference_cap_retains_all_subjects(
+    repositories: PersistenceRepositories, tmp_path: Path, limit: int,
+) -> None:
+    media_dir = tmp_path / "media"
+    save, source, characters, references = _group_image_scene(repositories, media_dir)
+    provider = RecordingImageProvider(_VALID_PNG_BYTES, image_reference_limit=limit)
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider}, media_dir=media_dir,
+    )
+
+    asset = asyncio.run(service.generate_character_image_for_message(
+        save_id=save.id, source_message_id=source.id,
+        character_ids=tuple(character.id for character in characters[:3]),
+    ))
+
+    request = provider.image_requests[0]
+    assert request.source_media_asset_ids == tuple(r.id for r in references[:limit])
+    assert (
+        "exactly 3 subjects together in one frame: Mara, Oren, Nira" in request.prompt
+    )
+    assert f"Attached image {limit + 1}" not in request.prompt
+    context = _chat_request_context(provider.chat_requests[0])
+    for character in characters[:3]:
+        assert character.appearance in context
+    metadata = json.loads(asset.metadata_json)
+    assert metadata["character_ids"] == [c.id for c in characters[:3]]
+    assert metadata["source_character_reference_character_ids"] == [
+        c.id for c in characters[:limit]
+    ]
+
+
+@pytest.mark.parametrize("shared_reference", [False, True])
+def test_character_group_image_fallback_keeps_membership_and_actual_mapping(
+    repositories: PersistenceRepositories, tmp_path: Path, shared_reference: bool,
+) -> None:
+    media_dir = tmp_path / "media"
+    save, source, characters, references = _group_image_scene(repositories, media_dir)
+    if shared_reference:
+        for link in repositories.list_entity_links(save.id):
+            if (
+                link.entity_id == characters[1].id
+                and link.relation == "reference_image"
+            ):
+                repositories.delete_entity_link(link.id)
+        repositories.add_entity_link(
+            save_id=save.id, entity_type="character", entity_id=characters[1].id,
+            target_type="media_asset", target_id=references[0].id,
+            relation="reference_image",
+        )
+    repositories.set_model_preference(
+        task="image_to_image_generation", provider="primary", model_id="primary/edit",
+    )
+    _configure_image_edit_fallback(repositories, enabled=True)
+    primary = SequenceImageProvider(provider_name="primary", outcomes=[
+        ProviderError(
+            ProviderErrorCategory.PROVIDER_ERROR, "image service unavailable",
+        ),
+    ])
+    primary._image_reference_limit = 3
+    fallback = SequenceImageProvider(provider_name="fallback-edit", outcomes=[
+        ImageResponse(provider="fallback-edit", model_id="fallback/edit",
+                      image_bytes=_VALID_PNG_BYTES),
+    ])
+    drafter = RecordingImageProvider(_VALID_PNG_BYTES)
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": drafter, "primary": primary, "fallback-edit": fallback},
+        media_dir=media_dir,
+    )
+
+    asset = asyncio.run(service.generate_character_image_for_message(
+        save_id=save.id, source_message_id=source.id,
+        character_ids=tuple(character.id for character in characters[:3]),
+    ))
+
+    assert len(primary.image_requests[0].source_media_asset_ids) == 3
+    request = fallback.image_requests[0]
+    assert request.source_media_asset_ids == (references[0].id,)
+    assert "Attached image 2" not in request.prompt
+    assert (
+        "exactly 3 subjects together in one frame: Mara, Oren, Nira" in request.prompt
+    )
+    assert "Oren: blue coveralls" in request.prompt
+    assert "Nira: gold tunic" in request.prompt
+    assert asset.prompt == request.prompt
+    metadata = json.loads(asset.metadata_json)
+    assert metadata["character_ids"] == [c.id for c in characters[:3]]
+    assert metadata["source_character_reference_character_ids"] == [characters[0].id]
+    assert metadata["source_character_reference_asset_ids"] == [references[0].id]
+
+
+@pytest.mark.parametrize("shared_reference", [False, True])
+def test_character_group_image_regeneration_keeps_membership_and_references(
+    repositories: PersistenceRepositories, tmp_path: Path, shared_reference: bool,
+) -> None:
+    media_dir = tmp_path / "media"
+    save, source, characters, references = _group_image_scene(repositories, media_dir)
+    provider = RecordingImageProvider(_VALID_PNG_BYTES, image_reference_limit=3)
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider}, media_dir=media_dir,
+    )
+    if shared_reference:
+        service.set_character_reference_image(
+            save_id=save.id, character_id=characters[1].id,
+            media_asset_id=references[0].id,
+        )
+    original = asyncio.run(service.generate_character_image_for_message(
+        save_id=save.id, source_message_id=source.id,
+        character_ids=tuple(character.id for character in characters[:3]),
+    ))
+
+    replacement = asyncio.run(service.regenerate_asset_with_prompt(
+        save_id=save.id, media_asset_id=original.id,
+        prompt="Mara, Oren, and Nira beside the lantern.",
+    ))
+
+    metadata = json.loads(replacement.metadata_json)
+    assert metadata["character_ids"] == [c.id for c in characters[:3]]
+    assert metadata["character_names"] == [c.name for c in characters[:3]]
+    assert metadata["source_character_reference_character_ids"] == [
+        c.id for c in characters[:3]
+    ]
+    expected_references = (
+        references[0].id,
+        references[0].id if shared_reference else references[1].id,
+        references[2].id,
+    )
+    assert provider.image_requests[-1].source_media_asset_ids == expected_references
+    assert metadata["source_character_reference_asset_ids"] == list(expected_references)
+    assert original.id not in [
+        asset.id for asset in repositories.list_media_assets(save.id)
+    ]
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_character_group_image_infers_clothing_only_for_latest_scene(
+    repositories: PersistenceRepositories, tmp_path: Path, historical: bool,
+) -> None:
+    media_dir = tmp_path / "media"
+    save, source, characters, references = _group_image_scene(repositories, media_dir)
+    for character in characters[:2]:
+        repositories.update_character(replace(character, current_clothing=""))
+    repositories.save_provider_model(
+        provider="fake", model_id="fake-structured", display_name="Fake Structured",
+        capabilities=["structured_output"],
+    )
+    repositories.set_model_preference(
+        task="response_planning", provider="fake", model_id="fake-structured",
+    )
+    if historical:
+        later = repositories.append_message(
+            save_id=save.id, role="narrator", body="The next day dawns.",
+        )
+        for character in characters[:2]:
+            repositories.update_character(replace(
+                character, appearance="LATER transformed appearance",
+                current_clothing="LATER scarlet armor",
+                last_updated_message_id=later.id,
+            ))
+        for reference in references[:2]:
+            repositories.connection.execute(
+                "UPDATE media_assets SET created_at = ? WHERE id = ?",
+                (source.created_at, reference.id),
+            )
+        repositories.commit()
+    provider = ClothingRecordingImageProvider([{
+        "characters": [
+            {"character_id": characters[0].id, "current_clothing": "green raincoat"},
+            {"character_id": characters[1].id, "current_clothing": "blue scarf"},
+        ],
+    }])
+    provider._image_reference_limit = 3
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider}, media_dir=media_dir,
+    )
+
+    asset = asyncio.run(service.generate_character_image_for_message(
+        save_id=save.id, source_message_id=source.id,
+        character_ids=tuple(character.id for character in characters[:2]),
+    ))
+
+    if historical:
+        assert provider.clothing_requests == []
+        assert "LATER" not in _chat_request_context(provider.chat_requests[0])
+        assert "LATER" not in asset.prompt
+    else:
+        assert len(provider.clothing_requests) == 1
+        assert "Mara: green raincoat" in asset.prompt
+        assert "Oren: blue scarf" in asset.prompt
+        for character_id, clothing in (
+            ("mara", "green raincoat"), ("oren", "blue scarf"),
+        ):
+            updated = repositories.get_character(character_id)
+            assert updated is not None and updated.current_clothing == clothing
+
+
+def test_character_group_image_rejects_later_reference_before_model_calls(
+    repositories: PersistenceRepositories, tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save, source, characters, references = _group_image_scene(repositories, media_dir)
+    later = repositories.append_message(
+        save_id=save.id, role="narrator", body="The next day dawns.",
+    )
+    repositories.connection.execute(
+        "UPDATE media_assets SET source_message_id = ? WHERE id = ?",
+        (later.id, references[1].id),
+    )
+    repositories.commit()
+    provider = RecordingImageProvider(_VALID_PNG_BYTES)
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider}, media_dir=media_dir,
+    )
+
+    with pytest.raises(ValueError, match="reference image.*selected moment"):
+        asyncio.run(service.generate_character_image_for_message(
+            save_id=save.id, source_message_id=source.id,
+            character_ids=tuple(character.id for character in characters[:2]),
+        ))
+
+    assert provider.chat_requests == []
+    assert provider.image_requests == []

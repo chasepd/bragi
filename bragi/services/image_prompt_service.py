@@ -115,6 +115,13 @@ class ImagePromptBrief:
     def required_text(self) -> str:
         """Return authoritative visual constraints exactly once, in stable order."""
         sections: list[str] = []
+        if self.purpose == "group_characters" and self.subjects:
+            names = ", ".join(subject.name for subject in self.subjects)
+            sections.append(
+                f"Depict exactly {len(self.subjects)} subjects together in one frame: "
+                f"{names}. Include every selected character and no other scene "
+                "participants."
+            )
         clothing = [
             f"{subject.name}: {subject.current_clothing.strip()}"
             for subject in self.subjects
@@ -188,6 +195,12 @@ _PURPOSE_INSTRUCTIONS = {
     "solo_character": (
         "Depict exactly one subject, the selected character, in a clear solo "
         "picture. Retain relevant surroundings without adding other characters."
+    ),
+    "group_characters": (
+        "Depict all selected characters together in one coherent frame, with each "
+        "character clearly visible and distinguishable. Include exactly the selected "
+        "subjects, retaining relevant surroundings without adding unselected scene "
+        "participants."
     ),
     "character_attachment": (
         "Depict only the selected character in the in-world picture requested "

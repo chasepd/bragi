@@ -442,7 +442,7 @@ def _message_actions(
         actions.append(
             ChronicleMessageAction(
                 action_id="generate-character-image",
-                label="Generate image of a character",
+                label="Generate image of characters",
             )
         )
     actions.append(

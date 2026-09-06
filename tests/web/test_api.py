@@ -1041,6 +1041,14 @@ def test_user_cannot_access_another_users_save_by_direct_id(
         other_head = client.get(f"/api/saves/{rook_save.id}/chronicle/head")
         other_settings = client.get(f"/api/settings?save_id={rook_save.id}")
         other_load = client.post(f"/api/saves/{rook_save.id}/load")
+        other_character_image = client.post(
+            "/api/media/generate-character-image",
+            json={
+                "save_id": rook_save.id,
+                "message_id": "message-1",
+                "character_ids": ["character-1", "character-2"],
+            },
+        )
 
     assert login.status_code == 200
     assert visible.status_code == 200
@@ -1057,6 +1065,7 @@ def test_user_cannot_access_another_users_save_by_direct_id(
     assert other_head.status_code == 404
     assert other_settings.status_code == 404
     assert other_load.status_code == 404
+    assert other_character_image.status_code == 404
 
 
 def test_save_list_orders_visible_saves_by_latest_message_activity(
@@ -1672,7 +1681,7 @@ def test_child_role_can_read_chat_and_generate_media_but_cannot_mutate_save(
             "/api/media/generate-character-image",
             json={
                 "message_id": "message-1",
-                "character_id": "character-1",
+                "character_ids": ["character-1", "character-2"],
                 "save_id": assigned_save.id,
             },
         )
@@ -18617,6 +18626,93 @@ def test_character_image_generation_endpoint_queues_runtime_call(
     assert job["status"] == "succeeded"
     assert job["type"] == "character_image_generation"
     assert runtime.character_image_calls == [("message-1", "character-1", "save-1")]
+
+
+@pytest.mark.parametrize("character_ids", [
+    ["character-1"],
+    ["character-2", "character-1"],
+    ["character-3", "character-1", "character-2"],
+])
+def test_character_image_generation_endpoint_accepts_ordered_selection(
+    tmp_path: Path,
+    character_ids: list[str],
+) -> None:
+    class GroupImageRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.selection: tuple[str, ...] = ()
+            self.source_message_id: str | None = None
+            self.save_id: str | None = None
+
+        async def generate_character_image(
+            self,
+            *,
+            source_message_id: str,
+            character_ids: tuple[str, ...],
+            active_save_id: str,
+            retry_progress_callback: Callable[[object], None],
+            current_user_id: str | None,
+        ) -> dict[str, object]:
+            self.selection = character_ids
+            self.source_message_id = source_message_id
+            self.save_id = active_save_id
+            retry_progress_callback(SimpleNamespace(next_attempt=2, max_attempts=3))
+            return _chat_model("The selected characters stand together by the beacon.")
+
+    runtime = GroupImageRuntime()
+    state = _state_double(tmp_path, runtime)
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        created = client.post(
+            "/api/media/generate-character-image",
+            json={
+                "message_id": "message-1",
+                "character_ids": character_ids,
+                "save_id": "save-1",
+            },
+        )
+        assert created.status_code == 200
+        job = _wait_for_terminal_job(client, created.json()["id"], save_id="save-1")
+        events = client.get(
+            f"/api/jobs/{created.json()['id']}/events?save_id=save-1"
+        )
+
+    assert job["status"] == "succeeded"
+    assert job["type"] == "character_image_generation"
+    assert runtime.selection == tuple(character_ids)
+    assert runtime.source_message_id == "message-1"
+    assert runtime.save_id == "save-1"
+    assert events.status_code == 200
+    assert "Retrying image" in events.text
+
+
+@pytest.mark.parametrize("selection", [
+    {},
+    {"character_ids": []},
+    {"character_ids": ["a", "b", "c", "d"]},
+    {"character_ids": ["a", "a"]},
+    {"character_ids": ["a", " "]},
+    {"character_ids": [""]},
+    {"character_ids": None},
+    {"character_id": ""},
+    {"character_id": " "},
+    {"character_id": None},
+    {"character_id": "a", "character_ids": ["b"]},
+    {"character_id": None, "character_ids": ["b"]},
+    {"character_id": "a", "character_ids": None},
+])
+def test_character_image_generation_endpoint_rejects_invalid_selection(
+    tmp_path: Path,
+    selection: dict[str, object],
+) -> None:
+    state = _state_double(tmp_path)
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.post(
+            "/api/media/generate-character-image",
+            json={"message_id": "message-1", "save_id": "save-1", **selection},
+        )
+
+    assert response.status_code == 422
+    assert state.jobs.list_active(save_id="save-1") == []
 
 
 def test_character_registry_image_endpoint_queues_runtime_call(

@@ -10396,6 +10396,94 @@ def test_generate_image_for_narrator_message_updates_latest_image(
     assert image_path.read_bytes() == b"runtime fake scene image"
 
 
+def test_generate_character_image_uses_all_selected_characters_in_requested_save(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, narrator_id = _persist_runtime_save(repositories)
+    other_save_id, _ = _persist_runtime_save(repositories, title="Another watch")
+    characters = [
+        repositories.add_character(
+            save_id=save_id,
+            name=name,
+            appearance=appearance,
+            current_clothing="A blue raincoat",
+        )
+        for name, appearance in [
+            ("Wren", "Curly red hair"), ("Aster", "Long dark hair"),
+        ]
+    ]
+    references = []
+    for character in characters:
+        reference_path = tmp_path / "media" / f"{character.id}.png"
+        reference_path.parent.mkdir(exist_ok=True)
+        reference_path.write_bytes(b"runtime fake reference image")
+        reference = repositories.create_media_asset(
+            save_id=save_id,
+            source_message_id=narrator_id,
+            type="image",
+            path=reference_path.name,
+            prompt=f"Reference of {character.name}",
+            provider="fake",
+            model="fake-image",
+            status="succeeded",
+            metadata={"kind": "character_reference", "character_id": character.id},
+        )
+        references.append(reference.id)
+        repositories.add_entity_link(
+            save_id=save_id,
+            entity_type="character",
+            entity_id=character.id,
+            target_type="media_asset",
+            target_id=reference.id,
+            relation="reference_image",
+        )
+    repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        present_character_ids=[character.id for character in characters],
+    )
+    for task, model_id in [
+        ("image_prompt", "fake-chat"),
+        ("image_to_image_generation", "fake-edit"),
+    ]:
+        repositories.set_model_preference(task=task, provider="fake", model_id=model_id)
+
+    class GroupImageProvider(RuntimeFakeProvider):
+        def image_reference_limit(self, model_id: str) -> int:
+            return 3
+
+    provider = GroupImageProvider()
+    controller = _runtime_controller(
+        runtime, repositories, tmp_path,
+        provider=provider, context_search_service=NoopContextSearch(),
+    )
+    controller.load_save(other_save_id)
+    selection = tuple(character.id for character in reversed(characters))
+
+    model = asyncio.run(controller.generate_character_image(
+        source_message_id=narrator_id,
+        character_ids=selection,
+        active_save_id=save_id,
+    ))
+
+    assert model.error is None
+    assert model.active_save_id == save_id
+    assert len(provider.image_requests) == 1
+    assert provider.image_requests[0].source_media_asset_ids == tuple(
+        reversed(references)
+    )
+    generated = [
+        asset for asset in repositories.list_media_assets(save_id)
+        if json.loads(asset.metadata_json).get("kind") == "character_image"
+    ]
+    assert len(generated) == 1
+    assert json.loads(generated[0].metadata_json)["character_ids"] == list(selection)
+    assert generated[0].source_message_id == narrator_id
+    assert repositories.list_media_assets(other_save_id) == []
+
+
 def test_generate_image_skips_unavailable_image_prompt_model(
     repositories: PersistenceRepositories,
     tmp_path: Path,

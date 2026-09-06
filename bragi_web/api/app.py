@@ -48,7 +48,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -579,7 +579,25 @@ class MediaMessageRequest(MessageRequest):
 
 
 class CharacterMediaMessageRequest(MessageRequest):
-    character_id: str
+    character_id: str | None = None
+    character_ids: list[str] | None = Field(default=None, min_length=1, max_length=3)
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> CharacterMediaMessageRequest:
+        fields = self.model_fields_set & {"character_id", "character_ids"}
+        if len(fields) != 1:
+            raise ValueError("Supply either character_id or character_ids")
+        selection = (
+            [self.character_id] if "character_id" in fields else self.character_ids
+        )
+        if not selection or any(
+            character_id is None or not character_id.strip()
+            for character_id in selection
+        ):
+            raise ValueError("Select between 1 and 3 characters with nonblank IDs")
+        if len(set(selection)) != len(selection):
+            raise ValueError("Selected character IDs must be unique")
+        return self
 
 
 class ScenePresenceRequest(SaveScopedRequest):
@@ -4461,9 +4479,12 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             )
             kwargs: dict[str, Any] = {
                 "source_message_id": payload.message_id,
-                "character_id": payload.character_id,
                 "active_save_id": media_save_id,
             }
+            if payload.character_ids is not None:
+                kwargs["character_ids"] = tuple(payload.character_ids)
+            else:
+                kwargs["character_id"] = payload.character_id
             if _call_accepts_keyword(
                 state.runtime.generate_character_image,
                 "retry_progress_callback",

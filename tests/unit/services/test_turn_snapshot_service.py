@@ -569,6 +569,8 @@ def test_snapshot_json_remapping_updates_known_context_and_media_references() ->
                 {
                     "request_source_message_id": "text-old",
                     "sender_character_id": "character-old",
+                    "character_ids": ["character-old"],
+                    "character_names": ["Mara"],
                     "source_media_asset_id": "reference-old",
                     "source_media_asset_ids": ["reference-old"],
                     "source_character_reference_asset_id": "reference-old",
@@ -700,12 +702,128 @@ def test_snapshot_json_remapping_updates_known_context_and_media_references() ->
     assert media_metadata == {
         "request_source_message_id": "text-new",
         "sender_character_id": "character-new",
+        "character_ids": ["character-new"],
+        "character_names": ["Mara"],
         "source_media_asset_id": "reference-new",
         "source_media_asset_ids": ["reference-new"],
         "source_character_reference_asset_id": "reference-new",
         "source_character_reference_asset_ids": ["reference-new"],
         "source_character_reference_character_ids": ["character-new"],
     }
+
+
+def test_snapshot_group_media_prunes_membership_and_names_together() -> None:
+    active_ids = {
+        "characters": frozenset({"mara", "bryn"}),
+        "media_assets": frozenset({"ref-mara", "ref-orro", "ref-bryn"}),
+    }
+    metadata = json.dumps({
+        "kind": "character_image",
+        "character_ids": ["mara", "orro", "bryn"],
+        "character_names": ["Mara", "Orro", "Bryn"],
+        "source_character_reference_asset_ids": ["ref-mara", "ref-orro", "ref-bryn"],
+        "source_character_reference_character_ids": ["mara", "orro", "bryn"],
+        "source_character_reference_character_names": ["Mara", "Orro", "Bryn"],
+    })
+
+    assert not turn_snapshot_module._snapshot_media_metadata_resolves(
+        metadata, active_ids
+    )
+    pruned = turn_snapshot_module._prune_snapshot_media_metadata(
+        metadata, active_ids
+    )
+
+    assert json.loads(pruned) == {
+        "kind": "character_image",
+        "character_ids": ["mara", "bryn"],
+        "character_names": ["Mara", "Bryn"],
+        "source_character_reference_asset_ids": ["ref-mara", "ref-bryn"],
+        "source_character_reference_character_ids": ["mara", "bryn"],
+        "source_character_reference_character_names": ["Mara", "Bryn"],
+    }
+    assert turn_snapshot_module._snapshot_media_metadata_resolves(pruned, active_ids)
+
+
+def test_snapshot_backed_fork_preserves_ordered_group_image_membership(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    message = repositories.append_message(
+        save_id=save.id, role="narrator", body="The three wardens gather."
+    )
+    characters = [
+        repositories.add_character(save_id=save.id, name=name)
+        for name in ("Mara", "Orro", "Bryn")
+    ]
+    references = []
+    for character in characters:
+        reference = repositories.create_media_asset(
+            save_id=save.id,
+            type="image",
+            path=f"{character.name}.png",
+            prompt=f"Reference for {character.name}",
+            provider="fake",
+            model="fake-image",
+            status="succeeded",
+            metadata={"kind": "character_reference", "character_id": character.id},
+        )
+        (tmp_path / reference.path).write_bytes(character.name.encode())
+        references.append(reference)
+    group = repositories.create_media_asset(
+        save_id=save.id,
+        source_message_id=message.id,
+        source_media_asset_id=references[0].id,
+        type="image",
+        path="group.png",
+        prompt="The three wardens stand together.",
+        provider="fake",
+        model="fake-image",
+        status="succeeded",
+        metadata={
+            "kind": "character_image",
+            "character_ids": [character.id for character in characters],
+            "character_names": [character.name for character in characters],
+            "source_character_reference_asset_ids": [asset.id for asset in references],
+            "source_character_reference_character_ids": [
+                character.id for character in characters
+            ],
+            "source_character_reference_character_names": [
+                character.name for character in characters
+            ],
+        },
+    )
+    (tmp_path / group.path).write_bytes(b"group image")
+    service.capture_message_snapshot(save_id=save.id, message_id=message.id)
+
+    fork = SaveForkService(repositories).fork_from_message(
+        save_id=save.id, message_id=message.id, media_dir=tmp_path
+    )
+
+    fork_characters = {
+        character.name: character.id
+        for character in repositories.list_characters(fork.save.id)
+    }
+    fork_assets = repositories.list_media_assets(fork.save.id)
+    fork_group = next(asset for asset in fork_assets if asset.prompt == group.prompt)
+    metadata = json.loads(fork_group.metadata_json)
+    expected_ids = [fork_characters[name] for name in ("Mara", "Orro", "Bryn")]
+    assert metadata["character_ids"] == expected_ids
+    assert metadata["character_ids"] != [character.id for character in characters]
+    assert metadata["character_names"] == ["Mara", "Orro", "Bryn"]
+    assert metadata["source_character_reference_character_ids"] == expected_ids
+    fork_references = {
+        json.loads(asset.metadata_json)["character_id"]: asset.id
+        for asset in fork_assets
+        if json.loads(asset.metadata_json).get("kind") == "character_reference"
+    }
+    assert metadata["source_character_reference_asset_ids"] == [
+        fork_references[character_id] for character_id in expected_ids
+    ]
+    assert fork_group.source_media_asset_id == fork_references[expected_ids[0]]
+    assert (tmp_path / fork_group.path).read_bytes() == b"group image"
 
 
 def test_snapshot_knowledge_edge_merge_fails_closed_on_provenance_overflow() -> None:

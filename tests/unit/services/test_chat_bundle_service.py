@@ -5035,6 +5035,8 @@ def test_export_import_clears_archived_source_media_asset_reference(
             "source_media_asset_ids": [MEDIA_ASSET_ID],
             "source_character_reference_asset_id": MEDIA_ASSET_ID,
             "source_character_reference_asset_ids": [MEDIA_ASSET_ID],
+            "source_character_reference_character_ids": ["mara"],
+            "source_character_reference_character_names": ["Mara"],
         },
     )
     derived_path = media_dir / derived_media_path
@@ -5066,6 +5068,8 @@ def test_export_import_clears_archived_source_media_asset_reference(
     assert exported_metadata["source_media_asset_ids"] == []
     assert exported_metadata["source_character_reference_asset_id"] is None
     assert exported_metadata["source_character_reference_asset_ids"] == []
+    assert exported_metadata["source_character_reference_character_ids"] == []
+    assert exported_metadata["source_character_reference_character_names"] == []
     imported_assets = repositories.list_media_assets(imported_save_id)
     assert len(imported_assets) == 1
     assert imported_assets[0].source_media_asset_id is None
@@ -5074,6 +5078,8 @@ def test_export_import_clears_archived_source_media_asset_reference(
     assert imported_metadata["source_media_asset_ids"] == []
     assert imported_metadata["source_character_reference_asset_id"] is None
     assert imported_metadata["source_character_reference_asset_ids"] == []
+    assert imported_metadata["source_character_reference_character_ids"] == []
+    assert imported_metadata["source_character_reference_character_names"] == []
     assert (media_dir / imported_assets[0].path).read_bytes() == derived_media_bytes
 
 
@@ -5160,9 +5166,11 @@ def test_import_save_repairs_source_media_asset_when_source_is_snapshot_only(
     assert imported_metadata["source_character_reference_asset_ids"] == []
 
 
+@pytest.mark.parametrize("image_kind", ["scene_image", "character_image"])
 def test_export_import_preserves_exact_image_prompt_and_reference_mapping(
     repositories: PersistenceRepositories,
     tmp_path: Path,
+    image_kind: str,
 ) -> None:
     media_dir = tmp_path / "media"
     save = _seed_bundle_save(repositories, media_dir)
@@ -5208,7 +5216,9 @@ def test_export_import_preserves_exact_image_prompt_and_reference_mapping(
         model="test-image-model",
         status="succeeded",
         metadata={
-            "kind": "scene_image",
+            "kind": image_kind,
+            "character_ids": [character.id for character in characters],
+            "character_names": ["Orro", "Mara"],
             "image_prompt": prompt_metadata,
             "source_character_reference_asset_id": references[0].id,
             "source_character_reference_asset_ids": [item.id for item in references],
@@ -5239,7 +5249,8 @@ def test_export_import_preserves_exact_image_prompt_and_reference_mapping(
     imported_assets = repositories.list_media_assets(imported_save_id)
     imported_scene = next(
         asset for asset in imported_assets
-        if json.loads(asset.metadata_json).get("kind") == "scene_image"
+        if json.loads(asset.metadata_json).get("kind") == image_kind
+        and asset.prompt == exact_prompt
     )
     imported_references = {
         json.loads(asset.metadata_json)["character_id"]: asset
@@ -5253,6 +5264,8 @@ def test_export_import_preserves_exact_image_prompt_and_reference_mapping(
         imported_references[character_id].id for character_id in expected_character_ids
     ]
     metadata = json.loads(imported_scene.metadata_json)
+    assert metadata["character_ids"] == expected_character_ids
+    assert metadata["character_names"] == ["Orro", "Mara"]
     assert imported_scene.prompt == exact_prompt
     assert len(imported_scene.prompt) == metadata["image_prompt"]["submitted_chars"]
     assert metadata["image_prompt"] == prompt_metadata

@@ -161,7 +161,7 @@ or per user/session before using a save ID.
 | `/api/chat/fork-from-here` | Save-scoped | Fork only from an accessible save. |
 | `/api/messages/{message_id}/scene-presence` | Save-scoped | GET reads message scene presence for an accessible save; POST replaces presence only when role can mutate the save. |
 | `/api/media/generate` | Save-scoped | Generate media only for an accessible save. Child requests are allowed only when the generated prompt passes the account rating and Venice is the provider, with safe mode forced on and unsafe fallbacks disabled. |
-| `/api/media/generate-character-image` | Save-scoped | Generate a solo image for a selected present character with an existing reference image in an accessible save. Child content safeguards apply. |
+| `/api/media/generate-character-image` | Save-scoped | Generate one image of one to three selected present characters, each with an existing reference image, in an accessible save. Child content safeguards apply. |
 | `/api/media/initial` | Save-scoped | Generate initial media only for an accessible save. Child content safeguards apply. |
 | `/api/media/character-reference/upload` | Save-scoped | Upload references only for an accessible save; child blocked. |
 | `/api/media/character-reference/remove` | Save-scoped | Remove references only for an accessible save; child blocked. |

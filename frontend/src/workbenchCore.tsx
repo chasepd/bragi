@@ -6358,6 +6358,7 @@ function Chronicle({
       ) : null}
       {characterImageMessage ? (
         <CharacterImageChooserDialog
+          key={`${activeSaveId}:${characterImageMessage.message_id}`}
           message={characterImageMessage}
           activeSaveId={activeSaveId}
           runJob={runJob}
@@ -6737,7 +6738,9 @@ function CharacterImageChooserDialog({
   onClose: () => void;
   onStarted: () => void;
 }) {
-  const [selectedCharacterId, setSelectedCharacterId] = useState("");
+  const [selectedCharacterIds, setSelectedCharacterIds] = useState<string[]>();
+  const [submitting, setSubmitting] = useState(false);
+  const submissionPending = useRef(false);
   const [error, setError] = useState("");
   const titleId = React.useId();
   const presence = useQuery({
@@ -6752,23 +6755,38 @@ function CharacterImageChooserDialog({
     [presence.data?.characters]
   );
   useEffect(() => {
-    if (!selectedCharacterId && eligible[0]) setSelectedCharacterId(eligible[0].character_id);
-  }, [eligible, selectedCharacterId]);
-  const selectedCharacter = eligible.find((character) => character.character_id === selectedCharacterId) ?? eligible[0] ?? null;
+    if (!presence.data) return;
+    setSelectedCharacterIds((current) => current
+      ? current.filter((id) => eligible.some((character) => character.character_id === id))
+      : eligible.slice(0, 1).map((character) => character.character_id));
+  }, [eligible, presence.data]);
+  const selectedIds = (selectedCharacterIds ?? []).filter((id) => eligible.some((character) => character.character_id === id));
+  const toggleCharacter = (characterId: string) => {
+    setSelectedCharacterIds((current = []) => {
+      if (current.includes(characterId)) return current.filter((id) => id !== characterId);
+      return current.length < 3 ? [...current, characterId] : current;
+    });
+  };
+  const generateDisabled = !activeSaveId || !selectedIds.length || presence.isLoading || submitting;
   const start = async () => {
-    if (!activeSaveId || !selectedCharacter) return;
+    if (generateDisabled || submissionPending.current) return;
+    submissionPending.current = true;
+    setSubmitting(true);
     setError("");
     try {
       const job = await postJson<Job>("/api/media/generate-character-image", {
         save_id: activeSaveId,
         message_id: message.message_id,
-        character_id: selectedCharacter.character_id
+        character_ids: selectedIds
       });
       onStarted();
       onClose();
       runJob(job, { onSucceeded: onStarted });
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Could not start character image");
+    } finally {
+      submissionPending.current = false;
+      setSubmitting(false);
     }
   };
   return (
@@ -6781,36 +6799,43 @@ function CharacterImageChooserDialog({
         {presence.isLoading ? <p className="muted">Loading...</p> : null}
         {presence.error instanceof Error ? <InlineNotice>{presence.error.message}</InlineNotice> : null}
         {error ? <InlineNotice>{error}</InlineNotice> : null}
+        <p className="muted">
+          <span>Select up to 3 characters</span>{" · "}
+          <span aria-live="polite">{selectedIds.length} of 3 selected</span>
+        </p>
         <div className="character-image-choice-list">
-          {eligible.map((character) => (
-            <label className="character-image-choice" key={character.character_id}>
-              <input
-                type="radio"
-                name={`character-image-${message.message_id}`}
-                checked={selectedCharacter?.character_id === character.character_id}
-                onChange={() => setSelectedCharacterId(character.character_id)}
-              />
-              {character.reference_image ? (
-                <img
-                  src={mediaAssetThumbnailPath(character.reference_image.media_asset_id, activeSaveId)}
-                  alt={character.name}
-                  loading="lazy"
-                  decoding="async"
+          {eligible.map((character) => {
+            const checked = selectedIds.includes(character.character_id);
+            return (
+              <label className="character-image-choice" key={character.character_id}>
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  disabled={submitting || (selectedIds.length >= 3 && !checked)}
+                  onChange={() => toggleCharacter(character.character_id)}
                 />
-              ) : (
-                <span className="character-image-choice-placeholder"><Users size={18} /></span>
-              )}
-              <span>
-                <strong>{character.name}</strong>
-                <small>{character.status || "Present"}</small>
-              </span>
-            </label>
-          ))}
+                {character.reference_image ? (
+                  <img
+                    src={mediaAssetThumbnailPath(character.reference_image.media_asset_id, activeSaveId)}
+                    alt={character.name}
+                    loading="lazy"
+                    decoding="async"
+                  />
+                ) : (
+                  <span className="character-image-choice-placeholder"><Users size={18} /></span>
+                )}
+                <span>
+                  <strong>{character.name}</strong>
+                  <small>{character.status || "Present"}</small>
+                </span>
+              </label>
+            );
+          })}
         </div>
         {!presence.isLoading && !eligible.length ? <InlineNotice>No present characters have reference images.</InlineNotice> : null}
         <div className="command-row end">
           <button type="button" onClick={onClose}>Cancel</button>
-          <button type="button" className="primary-command compact" disabled={!selectedCharacter} onClick={start}>
+          <button type="button" className="primary-command compact" disabled={generateDisabled} onClick={start}>
             <Image size={15} /> Generate
           </button>
         </div>

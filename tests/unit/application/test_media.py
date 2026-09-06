@@ -17,6 +17,34 @@ from bragi.persistence.repositories import PersistenceRepositories
 _MISSING = object()
 
 
+def test_media_model_labels_group_images_with_current_and_stored_names(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    media = _import_media_without_gtk(monkeypatch)
+    save_id = _save_with_media_history(repositories)
+    character = repositories.add_character(save_id=save_id, name="Mara")
+    asset = repositories.create_media_asset(
+        save_id=save_id,
+        type="image",
+        path="group.png",
+        prompt="Mara and Orro stand together.",
+        provider="fake",
+        model="fake-image",
+        status="succeeded",
+        metadata={
+            "kind": "character_image",
+            "character_ids": [character.id, "missing-character"],
+            "character_names": ["Old Mara", "Orro"],
+        },
+    )
+
+    model = media.build_media_model(repositories=repositories, save_id=save_id)
+
+    image = next(item for item in model.media_history if item.id == asset.id)
+    assert image.character_name == "Mara, Orro"
+
+
 class VideoProviderDouble:
     async def generate_video(self, _request: object) -> object:
         raise AssertionError("media model tests must not generate video")
