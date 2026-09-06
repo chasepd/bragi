@@ -1681,7 +1681,7 @@ def test_child_role_can_read_chat_and_generate_media_but_cannot_mutate_save(
             "/api/media/generate-character-image",
             json={
                 "message_id": "message-1",
-                "character_id": "character-1",
+                "character_ids": ["character-1", "character-2"],
                 "save_id": assigned_save.id,
             },
         )

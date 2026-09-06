@@ -6637,7 +6637,8 @@ class BragiRuntime:
         self,
         *,
         source_message_id: str,
-        character_id: str,
+        character_id: str | None = None,
+        character_ids: tuple[str, ...] | None = None,
         active_save_id: str | None | object = ...,
         retry_progress_callback: ProviderRetryProgressCallback | None = None,
         current_user_id: str | None = None,
@@ -6696,6 +6697,8 @@ class BragiRuntime:
                     "character_id": character_id,
                     "job_context": "manual_character_image",
                 }
+                if character_ids is not None:
+                    kwargs["character_ids"] = character_ids
                 if (
                     retry_progress_callback is not None
                     and _call_accepts_keyword(
