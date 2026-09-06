@@ -10446,7 +10446,7 @@ def test_generate_character_image_uses_all_selected_characters_in_requested_save
     )
     for task, model_id in [
         ("image_prompt", "fake-chat"),
-        ("full_roleplay_image_to_image_generation", "fake-edit"),
+        ("image_to_image_generation", "fake-edit"),
     ]:
         repositories.set_model_preference(task=task, provider="fake", model_id=model_id)
 
