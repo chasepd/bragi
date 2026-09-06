@@ -894,10 +894,11 @@ def _character_generated_images(
     reference_images_by_character: dict[str, CharacterRegistryReferenceImageRow],
 ) -> dict[str, tuple[CharacterRegistryReferenceImageRow, ...]]:
     character_ids = {character.id for character in character_records}
-    reference_asset_character_ids = {
-        reference.media_asset_id: character_id
-        for character_id, reference in reference_images_by_character.items()
-    }
+    reference_asset_character_ids: dict[str, list[str]] = {}
+    for character_id, reference in reference_images_by_character.items():
+        reference_asset_character_ids.setdefault(reference.media_asset_id, []).append(
+            character_id
+        )
     rows: dict[str, list[MediaAssetRecord]] = {
         character_id: [] for character_id in character_ids
     }
@@ -905,24 +906,29 @@ def _character_generated_images(
     for asset in media_assets.values():
         metadata = _metadata(asset)
         kind = metadata.get("kind")
-        if asset.id in reference_asset_character_ids:
-            continue
         if kind not in {"character_image", "character_reference"}:
             continue
         linked_character_ids: list[str] = []
+        metadata_character_ids = metadata.get("character_ids")
+        if isinstance(metadata_character_ids, list):
+            linked_character_ids.extend(
+                character_id
+                for character_id in metadata_character_ids
+                if isinstance(character_id, str) and character_id in character_ids
+            )
         metadata_character_id = metadata.get("character_id")
         if (
             isinstance(metadata_character_id, str)
             and metadata_character_id in character_ids
         ):
             linked_character_ids.append(metadata_character_id)
-        if kind == "character_image":
-            source_character_id = reference_asset_character_ids.get(
-                asset.source_media_asset_id or ""
+        if kind == "character_image" and not linked_character_ids:
+            linked_character_ids.extend(
+                reference_asset_character_ids.get(asset.source_media_asset_id or "", [])
             )
-            if source_character_id is not None:
-                linked_character_ids.append(source_character_id)
         for character_id in dict.fromkeys(linked_character_ids):
+            if character_id in reference_asset_character_ids.get(asset.id, []):
+                continue
             key = (character_id, asset.id)
             if key in seen:
                 continue

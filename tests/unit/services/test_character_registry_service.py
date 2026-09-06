@@ -25,6 +25,7 @@ from bragi.services.character_registry_service import (
     CharacterRegistryRow,
     CharacterRegistryService,
 )
+from bragi.services.media_service import MediaService
 
 
 @pytest.fixture
@@ -95,6 +96,60 @@ class CountingPersistenceRepositories(PersistenceRepositories):
             character_ids=character_ids,
             include_archived=include_archived,
         )
+
+
+def test_group_image_stays_in_other_character_gallery_after_reference_promotion(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    characters = [
+        repositories.add_character(save_id=save.id, name=name)
+        for name in ("Mara", "Orro", "Bryn")
+    ]
+    group = repositories.create_media_asset(
+        save_id=save.id,
+        type="image",
+        path="group.png",
+        prompt="Mara and Orro together.",
+        provider="fake",
+        model="fake-image",
+        status="succeeded",
+        metadata={
+            "kind": "character_image",
+            "character_ids": [characters[0].id, characters[1].id],
+            "character_names": ["Mara", "Orro"],
+        },
+    )
+    service = CharacterRegistryService(repositories)
+    before = {
+        row.name: [image.media_asset_id for image in row.generated_images]
+        for row in service.build_model(active_save_id=save.id).characters
+    }
+    assert before == {"Mara": [group.id], "Orro": [group.id], "Bryn": []}
+
+    (tmp_path / group.path).write_bytes(b"group image")
+    MediaService(
+        repositories=repositories,
+        providers={},
+        media_dir=tmp_path,
+    ).set_character_reference_image(
+        save_id=save.id,
+        character_id=characters[0].id,
+        media_asset_id=group.id,
+    )
+
+    after = {
+        row.name: row
+        for row in service.build_model(active_save_id=save.id).characters
+    }
+    assert after["Mara"].reference_image is not None
+    assert after["Mara"].reference_image.media_asset_id == group.id
+    assert after["Mara"].generated_images == ()
+    assert [image.media_asset_id for image in after["Orro"].generated_images] == [
+        group.id
+    ]
+    assert after["Bryn"].generated_images == ()
 
 
 def test_build_model_ignores_retired_save_level_character_reference(

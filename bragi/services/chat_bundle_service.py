@@ -5133,23 +5133,51 @@ def _remap_imported_media_reference_metadata(
             media_asset_id_map,
         )
         remapped = dict(metadata)
+        group_character_ids = metadata.get("character_ids")
+        if isinstance(group_character_ids, list):
+            kept_indexes = [
+                index
+                for index, character_id in enumerate(group_character_ids)
+                if isinstance(character_id, str) and character_id in character_id_map
+            ]
+            remapped["character_ids"] = [
+                character_id_map[group_character_ids[index]] for index in kept_indexes
+            ]
+            group_names = metadata.get("character_names")
+            if isinstance(group_names, list):
+                remapped["character_names"] = [
+                    group_names[index] if index < len(group_names) else ""
+                    for index in kept_indexes
+                ]
         reference_character_ids = metadata.get(
             "source_character_reference_character_ids"
         )
         if isinstance(reference_character_ids, list):
-            remapped["source_character_reference_character_ids"] = [
-                character_id_map[character_id]
-                for character_id in reference_character_ids
+            reference_indexes = [
+                index
+                for index, character_id in enumerate(reference_character_ids)
                 if isinstance(character_id, str) and character_id in character_id_map
             ]
+            remapped["source_character_reference_character_ids"] = [
+                character_id_map[reference_character_ids[index]]
+                for index in reference_indexes
+            ]
+            for field in (
+                "source_character_reference_asset_ids",
+                "source_character_reference_character_names",
+            ):
+                values = metadata.get(field)
+                if isinstance(values, list):
+                    remapped[field] = [
+                        values[index] if index < len(values) else ""
+                        for index in reference_indexes
+                    ]
         if metadata.get("kind") in ("character_reference", "character_image"):
             character_id = metadata.get("character_id")
-            if (
-                not isinstance(character_id, str)
-                or character_id not in character_id_map
-            ):
+            if isinstance(character_id, str) and character_id in character_id_map:
+                remapped["character_id"] = character_id_map[character_id]
+            elif not isinstance(group_character_ids, list):
                 continue
-            remapped["character_id"] = character_id_map[character_id]
         elif _media_row_kind(row).startswith("character_text_"):
             character_id = metadata.get("character_id")
             thread_id = metadata.get("thread_id")
@@ -5242,7 +5270,8 @@ def _remapped_imported_media_source_metadata(
         if not isinstance(value, list):
             continue
         mapped_items: list[str] = []
-        for item in value:
+        kept_indexes: list[int] = []
+        for index, item in enumerate(value):
             if not isinstance(item, str) or not item:
                 continue
             mapped = _mapped_optional_media_asset_id(
@@ -5253,7 +5282,20 @@ def _remapped_imported_media_source_metadata(
             )
             if mapped is not None:
                 mapped_items.append(mapped)
+                kept_indexes.append(index)
         remapped[field] = mapped_items
+        if field == "source_character_reference_asset_ids":
+            for companion_field in (
+                "source_character_reference_character_ids",
+                "source_character_reference_character_names",
+            ):
+                companion_values = metadata.get(companion_field)
+                if isinstance(companion_values, list):
+                    remapped[companion_field] = [
+                        companion_values[index]
+                        if index < len(companion_values) else ""
+                        for index in kept_indexes
+                    ]
     return remapped
 
 

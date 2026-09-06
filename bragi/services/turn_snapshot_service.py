@@ -4050,6 +4050,7 @@ class _SnapshotRemapper:
                 "source_character_reference_character_id": "characters",
             }
             id_list_fields = {
+                "character_ids": "characters",
                 "source_media_asset_ids": "media_assets",
                 "source_character_reference_asset_ids": "media_assets",
                 "source_character_reference_character_ids": "characters",
@@ -5289,6 +5290,7 @@ def _snapshot_media_metadata_resolves(
         "source_character_reference_character_id": "characters",
     }
     id_list_fields = {
+        "character_ids": "characters",
         "source_media_asset_ids": "media_assets",
         "source_character_reference_asset_ids": "media_assets",
         "source_character_reference_character_ids": "characters",
@@ -5539,12 +5541,61 @@ def _prune_snapshot_media_metadata(
         "source_character_reference_character_id": "characters",
     }
     id_list_fields = {
+        "character_ids": "characters",
         "source_media_asset_ids": "media_assets",
         "source_character_reference_asset_ids": "media_assets",
         "source_character_reference_character_ids": "characters",
     }
     pruned = dict(parsed)
+    reference_list_fields = (
+        "source_character_reference_asset_ids",
+        "source_character_reference_character_ids",
+        "source_character_reference_character_names",
+    )
+    reference_assets = parsed.get(reference_list_fields[0])
+    reference_characters = parsed.get(reference_list_fields[1])
+    if isinstance(reference_assets, list):
+        reference_indexes = [
+            index
+            for index, asset_id in enumerate(reference_assets)
+            if isinstance(asset_id, str)
+            and asset_id in active_ids["media_assets"]
+            and (
+                not isinstance(reference_characters, list)
+                or (
+                    index < len(reference_characters)
+                    and isinstance(reference_characters[index], str)
+                    and reference_characters[index] in active_ids["characters"]
+                )
+            )
+        ]
+        for field in reference_list_fields:
+            values = parsed.get(field)
+            if isinstance(values, list):
+                pruned[field] = [
+                    values[index] if index < len(values) else ""
+                    for index in reference_indexes
+                ]
     for key, item in parsed.items():
+        if isinstance(reference_assets, list) and key in reference_list_fields:
+            continue
+        if key == "character_names" and isinstance(parsed.get("character_ids"), list):
+            continue
+        if key == "character_ids" and isinstance(item, list):
+            kept_indexes = [
+                index
+                for index, character_id in enumerate(item)
+                if isinstance(character_id, str)
+                and character_id in active_ids["characters"]
+            ]
+            pruned[key] = [item[index] for index in kept_indexes]
+            names = parsed.get("character_names")
+            if isinstance(names, list):
+                pruned["character_names"] = [
+                    names[index] if index < len(names) else ""
+                    for index in kept_indexes
+                ]
+            continue
         if key == "request_source_message_id":
             if (
                 isinstance(item, str)

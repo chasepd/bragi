@@ -262,6 +262,28 @@ def _character_media_name(
 ) -> str | None:
     if metadata.get("kind") not in _CHARACTER_NAME_MEDIA_KINDS:
         return None
+    character_ids = metadata.get("character_ids")
+    if isinstance(character_ids, list):
+        stored_names = metadata.get("character_names")
+        names = []
+        for index, character_id in enumerate(character_ids):
+            name = (
+                character_names_by_id.get(character_id)
+                if isinstance(character_id, str)
+                else None
+            )
+            if (
+                not name
+                and isinstance(stored_names, list)
+                and index < len(stored_names)
+            ):
+                stored_name = stored_names[index]
+                if isinstance(stored_name, str):
+                    name = stored_name.strip()
+            if name:
+                names.append(name)
+        if names:
+            return ", ".join(names)
     character_id = metadata.get("character_id")
     if isinstance(character_id, str):
         current_name = character_names_by_id.get(character_id)
