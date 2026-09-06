@@ -162,6 +162,7 @@ def test_draft_preserves_full_profiles_and_distinct_actions_in_plain_prose(
         ("scene", "complete scene"),
         ("character_reference", "simple background"),
         ("solo_character", "exactly one subject"),
+        ("group_characters", "all selected characters together"),
         ("character_attachment", "arm's-length"),
         ("object_attachment", "requested object"),
     ],
@@ -179,6 +180,27 @@ def test_each_purpose_uses_the_shared_prose_drafter(
 
     assert prompt == "A detailed visual frame."
     assert direction in provider.requests[0].messages[0].body
+
+
+def test_group_prompt_keeps_every_selected_subject_when_prose_omits_them(
+    repositories: PersistenceRepositories,
+) -> None:
+    provider = ProseProvider("A sunlit bridge.")
+    service = _service(repositories, provider)
+    brief = ImagePromptBrief(
+        purpose="group_characters",
+        subjects=(ImagePromptSubject("mira", "Mira"),
+                  ImagePromptSubject("oren", "Oren")),
+        style_preset="none",
+    )
+
+    prompt = asyncio.run(service.draft(
+        save_id="save", source_message_id="moment", brief=brief,
+    ))
+
+    assert "exactly 2 subjects together in one frame: Mira, Oren" in prompt
+    assert "no other scene participants" in prompt
+    assert prompt.endswith(brief.required_text())
 
 
 def test_draft_reserves_required_tail_and_compresses_once(
