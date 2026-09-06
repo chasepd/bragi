@@ -2921,7 +2921,7 @@ describe("frontend helpers", () => {
               },
               {
                 action_id: "generate-character-image",
-                label: "Generate image of a character"
+                label: "Generate image of characters"
               }
             ]
           }
@@ -2936,7 +2936,7 @@ describe("frontend helpers", () => {
     );
 
     await userEvent.click(screen.getByTitle("Generate image of this scene"));
-    await userEvent.click(screen.getByTitle("Generate image of a character"));
+    await userEvent.click(screen.getByTitle("Generate image of characters"));
     const dialog = await screen.findByRole("dialog", { name: "Generate character image" });
     await userEvent.click(within(dialog).getByRole("button", { name: "Generate" }));
 
@@ -2954,7 +2954,7 @@ describe("frontend helpers", () => {
     expect(JSON.parse(String(characterImageCall?.[1].body))).toEqual({
       save_id: "save-1",
       message_id: "narrator-1",
-      character_id: "character-oracle"
+      character_ids: ["character-oracle"]
     });
     expect(runJob).toHaveBeenCalledWith(
       expect.objectContaining({ id: "job-scene-image" }),
@@ -2964,6 +2964,193 @@ describe("frontend helpers", () => {
       expect.objectContaining({ id: "job-character-image" }),
       expect.objectContaining({ onSucceeded: expect.any(Function) })
     );
+  });
+
+  describe("character image chooser", () => {
+    const scenePresence = () => ({
+      save_id: "save-1",
+      message_id: "narrator-1",
+      latest_message: true,
+      characters: ["Oracle", "Guardian", "Scholar", "Ranger", "Absent", "Unpictured"].map((name) => ({
+        character_id: `character-${name.toLowerCase()}`,
+        name,
+        present: name !== "Absent",
+        has_reference_image: name !== "Unpictured",
+        reference_image: {
+          media_asset_id: `reference-${name.toLowerCase()}`,
+          mime_type: "image/png",
+          prompt_preview: `${name} reference`,
+          provider: "local",
+          model: "upload"
+        },
+        is_player_character: false,
+        status: "present"
+      }))
+    });
+    const chooserModel = (saveId = "save-1", messageId = "narrator-1") => runtimeModel({
+      active_save_id: saveId,
+      chronicle: {
+        messages: [{
+          message_id: messageId,
+          role: "narrator",
+          speaker_name: null,
+          body: "The group gathers in the courtyard.",
+          actions: [{ action_id: "generate-character-image", label: "Generate image of characters" }]
+        }]
+      }
+    });
+    const queuedJob = {
+      id: "job-character-image",
+      type: "character_image_generation",
+      status: "queued",
+      result: null,
+      error: null
+    };
+    const ok = (value: unknown) => ({ ok: true, json: async () => value });
+    const renderChooser = async (client = new QueryClient({ defaultOptions: { queries: { retry: false } } })) => {
+      const { Chronicle } = await import("./main");
+      const runJob = vi.fn();
+      const view = render(
+        <QueryClientProvider client={client}>
+          <Chronicle model={chooserModel()} runJob={runJob} pendingMessage={null} />
+        </QueryClientProvider>
+      );
+      await userEvent.click(screen.getByTitle("Generate image of characters"));
+      const dialog = await screen.findByRole("dialog", { name: "Generate character image" });
+      return { client, dialog, runJob, view, Chronicle };
+    };
+
+    it("selects up to three eligible characters and submits them in selection order", async () => {
+      const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve(
+        ok(path.includes("/scene-presence") ? scenePresence() : queuedJob)
+      ));
+      vi.stubGlobal("fetch", fetchMock);
+      const { dialog, runJob } = await renderChooser();
+      const oracle = await within(dialog).findByRole("checkbox", { name: /Oracle/ });
+      const guardian = within(dialog).getByRole("checkbox", { name: /Guardian/ });
+      const scholar = within(dialog).getByRole("checkbox", { name: /Scholar/ });
+      const ranger = within(dialog).getByRole("checkbox", { name: /Ranger/ });
+      expect(oracle).toBeChecked();
+      expect(guardian).not.toBeChecked();
+      expect(within(dialog).getAllByRole("checkbox")).toHaveLength(4);
+      expect(within(dialog).getAllByRole("img")).toHaveLength(4);
+      expect(within(dialog).getByText("Select up to 3 characters")).toBeInTheDocument();
+      expect(within(dialog).getByText("1 of 3 selected")).toBeInTheDocument();
+
+      await userEvent.click(oracle);
+      expect(oracle).not.toBeChecked();
+      expect(within(dialog).getByText("0 of 3 selected")).toBeInTheDocument();
+      expect(within(dialog).getByRole("button", { name: "Generate" })).toBeDisabled();
+      await userEvent.click(scholar);
+      await userEvent.click(oracle);
+      await userEvent.click(guardian);
+      expect(within(dialog).getByText("3 of 3 selected")).toBeInTheDocument();
+      expect(ranger).toBeDisabled();
+      expect(oracle).toBeEnabled();
+      expect(guardian).toBeEnabled();
+      expect(scholar).toBeEnabled();
+      await userEvent.click(ranger);
+      expect(ranger).not.toBeChecked();
+      await userEvent.click(oracle);
+      expect(ranger).toBeEnabled();
+      await userEvent.click(ranger);
+      await userEvent.click(within(dialog).getByRole("button", { name: "Generate" }));
+
+      const imageRequests = fetchMock.mock.calls.filter(([path]) => path === "/api/media/generate-character-image");
+      expect(imageRequests).toHaveLength(1);
+      expect(JSON.parse(String(imageRequests[0][1].body))).toEqual({
+        save_id: "save-1",
+        message_id: "narrator-1",
+        character_ids: ["character-scholar", "character-guardian", "character-ranger"]
+      });
+      expect(screen.queryByRole("dialog", { name: "Generate character image" })).not.toBeInTheDocument();
+      expect(runJob).toHaveBeenCalledWith(queuedJob, expect.objectContaining({ onSucceeded: expect.any(Function) }));
+    });
+
+    it("disables generation while loading and submitting, preserves selections after failure, and allows retry", async () => {
+      const presenceResponse = deferred<ReturnType<typeof ok>>();
+      const imageResponse = deferred<{ ok: boolean; status: number; json: () => Promise<unknown> }>();
+      const fetchMock = vi.fn().mockImplementation((path: string) => (
+        path.includes("/scene-presence") ? presenceResponse.promise : imageResponse.promise
+      ));
+      vi.stubGlobal("fetch", fetchMock);
+      const { dialog, runJob } = await renderChooser();
+      const generate = within(dialog).getByRole("button", { name: "Generate" });
+      expect(generate).toBeDisabled();
+      await act(async () => presenceResponse.resolve(ok(scenePresence())));
+      const guardian = await within(dialog).findByRole("checkbox", { name: /Guardian/ });
+      await userEvent.click(guardian);
+      await userEvent.dblClick(generate);
+      expect(generate).toBeDisabled();
+      expect(guardian).toBeDisabled();
+      expect(fetchMock.mock.calls.filter(([path]) => path === "/api/media/generate-character-image")).toHaveLength(1);
+
+      await act(async () => imageResponse.resolve({
+        ok: false,
+        status: 503,
+        json: async () => ({ detail: "Character image could not start." })
+      }));
+      expect(await within(dialog).findByText("Character image could not start.")).toBeInTheDocument();
+      expect(within(dialog).getByRole("checkbox", { name: /Oracle/ })).toBeChecked();
+      expect(guardian).toBeChecked();
+      expect(generate).toBeEnabled();
+      expect(runJob).not.toHaveBeenCalled();
+      fetchMock.mockResolvedValue(ok(queuedJob));
+      await userEvent.click(generate);
+      const imageRequests = fetchMock.mock.calls.filter(([path]) => path === "/api/media/generate-character-image");
+      expect(imageRequests).toHaveLength(2);
+      expect(JSON.parse(String(imageRequests[1][1].body)).character_ids).toEqual(["character-oracle", "character-guardian"]);
+      expect(screen.queryByRole("dialog", { name: "Generate character image" })).not.toBeInTheDocument();
+    });
+
+    it("prunes selections after eligibility refresh without choosing replacement characters", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(ok(scenePresence())));
+      const { client, dialog } = await renderChooser();
+      await within(dialog).findByRole("checkbox", { name: /Oracle/ });
+      await userEvent.click(within(dialog).getByRole("checkbox", { name: /Guardian/ }));
+      const updatedPresence = scenePresence();
+      updatedPresence.characters[0].present = false;
+      await act(async () => client.setQueryData(["scene-presence", "save-1", "narrator-1"], updatedPresence));
+      await waitFor(() => expect(within(dialog).queryByRole("checkbox", { name: /Oracle/ })).not.toBeInTheDocument());
+      expect(within(dialog).getByRole("checkbox", { name: /Guardian/ })).toBeChecked();
+      expect(within(dialog).getByText("1 of 3 selected")).toBeInTheDocument();
+
+      const noSelectionPresence = scenePresence();
+      noSelectionPresence.characters[0].present = false;
+      noSelectionPresence.characters[1].has_reference_image = false;
+      await act(async () => client.setQueryData(["scene-presence", "save-1", "narrator-1"], noSelectionPresence));
+      expect(await within(dialog).findByText("0 of 3 selected")).toBeInTheDocument();
+      expect(within(dialog).getByRole("button", { name: "Generate" })).toBeDisabled();
+      expect(within(dialog).getByRole("checkbox", { name: /Scholar/ })).not.toBeChecked();
+      await act(async () => client.setQueryData(["scene-presence", "save-1", "narrator-1"], scenePresence()));
+      expect(await within(dialog).findByRole("checkbox", { name: /Oracle/ })).not.toBeChecked();
+      expect(within(dialog).getByRole("button", { name: "Generate" })).toBeDisabled();
+    });
+
+    it("starts a fresh selection when opening another message and closes when switching saves", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(ok(scenePresence())));
+      const { client, dialog, view, Chronicle, runJob } = await renderChooser();
+      await userEvent.click(await within(dialog).findByRole("checkbox", { name: /Oracle/ }));
+      expect(within(dialog).getByRole("button", { name: "Generate" })).toBeDisabled();
+      view.rerender(
+        <QueryClientProvider client={client}>
+          <Chronicle model={chooserModel("save-1", "narrator-2")} runJob={runJob} pendingMessage={null} />
+        </QueryClientProvider>
+      );
+      fireEvent.click(screen.getByTitle("Generate image of characters"));
+      const nextDialog = await screen.findByRole("dialog", { name: "Generate character image" });
+      expect(await within(nextDialog).findByRole("checkbox", { name: /Oracle/ })).toBeChecked();
+      expect(within(nextDialog).getByText("1 of 3 selected")).toBeInTheDocument();
+      view.rerender(
+        <QueryClientProvider client={client}>
+          <Chronicle model={chooserModel("save-2", "narrator-3")} runJob={runJob} pendingMessage={null} />
+        </QueryClientProvider>
+      );
+      expect(screen.queryByRole("dialog", { name: "Generate character image" })).not.toBeInTheDocument();
+      await userEvent.click(screen.getByTitle("Generate image of characters"));
+      const saveDialog = await screen.findByRole("dialog", { name: "Generate character image" });
+      expect(await within(saveDialog).findByRole("checkbox", { name: /Oracle/ })).toBeChecked();
+    });
   });
 
   it("invalidates scene-presence cache for the active save after reference changes", async () => {

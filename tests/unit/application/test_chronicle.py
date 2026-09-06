@@ -511,7 +511,7 @@ def test_chronicle_character_messages_include_character_image_action(
     actions = _actions_by_id(_value(message, "actions"))
     assert actions["generate-scene-image"] == "Generate image of this scene"
     assert actions["view-characters-present"] == "Characters present"
-    assert actions["generate-character-image"] == "Generate image of a character"
+    assert actions["generate-character-image"] == "Generate image of characters"
 
 
 def test_chronicle_hides_character_image_action_when_message_not_eligible(
